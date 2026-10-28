@@ -101,6 +101,7 @@ class TuiApp:
         self.modal_items: list[tuple[Any, ...]] = []
         self.modal_filter = ""
         self.modal_sel = 0
+        self.modal_hint = ""
         self.modal_control = FormattedTextControl(
             self._modal_text, focusable=True
         )
@@ -391,9 +392,15 @@ class TuiApp:
 
     # ── модальный список ──────────────────────────────────────────────────
 
-    def _open_modal(self, title: str, items: list[tuple[Any, ...]]) -> None:
+    def _open_modal(
+        self,
+        title: str,
+        items: list[tuple[Any, ...]],
+        hint: str = "↑/↓ — выбор · Enter — выбрать · Esc — назад",
+    ) -> None:
         self.modal_title = title
         self.modal_items = items
+        self.modal_hint = hint
         self.modal_filter = ""
         self.modal_sel = 0
         self.modal_open = True
@@ -452,7 +459,7 @@ class TuiApp:
             lines.append((style, f" {mark} {label}\n"))
         if end < len(items):
             lines.append(("class:help", "  … ниже …\n"))
-        lines.append(("class:help", "\n ↑/↓ — выбор · Enter — применить · Esc — назад"))
+        lines.append(("class:help", f"\n {self.modal_hint}"))
         return lines
 
     def _modal_run(self) -> None:
@@ -504,7 +511,16 @@ class TuiApp:
     def _open_palette(self) -> None:
         self._open_modal("команды", self._command_items())
 
+    def _insert_input(self, text: str) -> None:
+        self.input_area.text = text
+        self.input_area.buffer.cursor_position = len(text)
+        self.app.layout.focus(self.input_area)
+        self.invalidate()
+
     def _help_items(self) -> list[tuple[Any, ...]]:
+        def insert(text: str) -> Any:
+            return lambda: self._insert_input(text)
+
         return [
             ("----- клавиши -----", None, "header"),
             ("Enter — отправить сообщение", None),
@@ -517,41 +533,46 @@ class TuiApp:
             ("Ctrl+←/→, Ctrl+W — по словам", None),
             ("Ctrl+C / Ctrl+Q — выход", None),
             ("----- чат -----", None, "header"),
-            ("/new [название] — новая сессия", None),
-            ("/sessions — список сессий", None),
-            ("/switch ID — переключиться на сессию", None),
-            ("/again — перегенерировать последний ответ", None),
-            ("/undo — удалить последний обмен", None),
-            ("/edit — править последний ответ (Enter — сохранить, Esc — отмена)", None),
-            ("/like | /dislike — оценка последнего ответа", None),
-            ("/variants N — N вариантов (0 — обычный поток)", None),
-            ("/temp X — температура 0–2", None),
-            ("/model [имя] — сменить или выбрать модель", None),
-            ("/history N — сколько сообщений показывать", None),
-            ("/export [md|jsonl] — выгрузить диалог", None),
-            ("/stats — статистика", None),
-            ("/quit — выход", None),
+            ("/new [название] — новая сессия", insert("/new ")),
+            ("/sessions — список сессий", insert("/sessions")),
+            ("/switch ID — переключиться на сессию", insert("/switch ")),
+            ("/again — перегенерировать последний ответ", insert("/again")),
+            ("/undo — удалить последний обмен", insert("/undo")),
+            ("/edit — править последний ответ", insert("/edit")),
+            ("/like — лайк последнему ответу", insert("/like")),
+            ("/dislike — дизлайк последнему ответу", insert("/dislike")),
+            ("/variants N — N вариантов (0 — обычный поток)", insert("/variants ")),
+            ("/temp X — температура 0–2", insert("/temp ")),
+            ("/model [имя] — сменить или выбрать модель", insert("/model ")),
+            ("/history N — сколько сообщений показывать", insert("/history ")),
+            ("/export [md|jsonl] — выгрузить диалог", insert("/export ")),
+            ("/stats — статистика", insert("/stats")),
+            ("/quit — выход", insert("/quit")),
             ("----- память и персонаж -----", None, "header"),
-            ("/remember текст — добавить факт", None),
-            ("/facts — показать факты", None),
-            ("/forget ID — убрать факт", None),
-            ("/compact — сжать историю в сводку", None),
-            ("/persona — карточка персонажа", None),
-            ("/persona edit — править карточку", None),
-            ("/persona reload — перечитать карточку", None),
+            ("/remember текст — добавить факт", insert("/remember ")),
+            ("/facts — показать факты", insert("/facts")),
+            ("/forget ID — убрать факт", insert("/forget ")),
+            ("/compact — сжать историю в сводку", insert("/compact")),
+            ("/persona — карточка персонажа", insert("/persona")),
+            ("/persona edit — править карточку", insert("/persona edit")),
+            ("/persona reload — перечитать карточку", insert("/persona reload")),
             ("----- модель -----", None, "header"),
-            ("/load — загрузить модель в память", None),
-            ("/unload — выгрузить модель", None),
-            ("/loaded — что загружено", None),
+            ("/load — загрузить модель в память", insert("/load")),
+            ("/unload — выгрузить модель", insert("/unload")),
+            ("/loaded — что загружено", insert("/loaded")),
             ("----- кейсы -----", None, "header"),
-            ("/case текст — добавить кейс", None),
-            ("/cases, /cases all — список кейсов", None),
+            ("/case текст — добавить кейс", insert("/case ")),
+            ("/cases — список кейсов", insert("/cases")),
+            ("/cases all — список с архивом", insert("/cases all")),
             ("прогон и правка кейсов — в --no-tui", None),
         ]
 
-
     def _open_help(self) -> None:
-        self._open_modal("помощь (Esc — закрыть)", self._help_items())
+        self._open_modal(
+            "помощь",
+            self._help_items(),
+            hint="↑/↓ — выбор · Enter — вставить в ввод · Esc — назад",
+        )
 
     def _model_menu(self) -> None:
         self.app.create_background_task(self._model_menu_async())

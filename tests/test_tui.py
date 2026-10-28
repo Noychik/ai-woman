@@ -115,6 +115,38 @@ class TuiConstructionTests(unittest.TestCase):
             app._run_command("/undo")
             self.assertEqual(app.store.last_message(session), None)
 
+    def test_help_insert_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "persona.md").write_text("# Алиса\n", encoding="utf-8")
+            cfg = Config(
+                root=root,
+                llm=LLMConfig(backend="mock", model="mock"),
+                chat=ChatConfig(),
+                paths=PathsConfig(),
+                memory=MemoryConfig(),
+                case=CaseConfig(),
+                content=ContentConfig(),
+            )
+            app = TuiApp(cfg)
+            self.addCleanup(app.close)
+            items = app._help_items()
+
+            def find(prefix):
+                for item in items:
+                    if item[0].startswith(prefix) and callable(item[1]):
+                        return item[1]
+                return None
+
+            find("/again")()
+            self.assertEqual(app.input_area.text, "/again")
+
+            find("/remember")()
+            self.assertEqual(app.input_area.text, "/remember ")
+
+            find("/switch")()
+            self.assertEqual(app.input_area.text, "/switch ")
+
 
 if __name__ == "__main__":
     unittest.main()
