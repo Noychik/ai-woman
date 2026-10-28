@@ -280,6 +280,13 @@ class Store:
             "SELECT * FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
 
+    def set_session_title(self, session_id: int, title: str) -> None:
+        self.conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            (title, session_id),
+        )
+        self.conn.commit()
+
     def latest_session(self) -> int | None:
         row = self.conn.execute(
             "SELECT id FROM sessions ORDER BY id DESC LIMIT 1"

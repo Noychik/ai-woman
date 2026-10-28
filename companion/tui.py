@@ -667,7 +667,9 @@ class TuiApp:
             ("/unload — выгрузить модель", insert("/unload")),
             ("/loaded (/ps) — что загружено", insert("/loaded")),
             ("----- кейсы -----", None, "header"),
-            ("/case текст — добавить кейс", insert("/case ")),
+            ("/case текст — добавить и сразу играть", insert("/case ")),
+            ("/case add текст — добавить без запуска", insert("/case add ")),
+            ("/case show ID — полная карточка кейса", insert("/case show ")),
             ("/case ID — начать прогон", insert("/case ")),
             ("/case suggest [идея] — модель предложит кейс", insert("/case suggest ")),
             ("/case + ID — дополнить поля кейса", insert("/case + ")),
@@ -1113,6 +1115,16 @@ class TuiApp:
             return
         action, _, rest = arg.partition(" ")
         action_lower = action.lower()
+        if action_lower in ("add", "добавить"):
+            self._case_add_only(rest.strip())
+            return
+        if action_lower in ("show", "показать", "open", "открыть"):
+            case_id = parse_id(rest)
+            if case_id is None:
+                self._flash("/case show ID")
+                return
+            self._show_case_detail(case_id, include_archived=True)
+            return
         if action_lower in ("suggest", "предложи", "придумай", "идея", "gen"):
             self._case_suggest(rest.strip())
             return
@@ -1151,7 +1163,7 @@ class TuiApp:
         except ValueError as exc:
             self._flash(str(exc)[:100])
             return
-        self._flash(f"кейс #{case.id} добавлен; /case + {case.id} — дополнить")
+        self._start_new_case(case)
 
     def _case_suggest(self, seed: str) -> None:
         if self._busy_guard():
@@ -1216,7 +1228,7 @@ class TuiApp:
             except ValueError as exc:
                 self._flash(str(exc)[:100])
                 return
-            self._flash(f"кейс #{case.id} добавлен")
+            self._start_new_case(case)
 
         def retry() -> None:
             self.app.create_background_task(
@@ -1252,7 +1264,9 @@ class TuiApp:
             return None
         return self.active_run.scenario
 
-    def _case_start(self, raw: str) -> None:
+    def _case_start(
+        self, raw: str, reuse_empty: bool = False
+    ) -> None:
         case_id = parse_id(raw)
         if case_id is None:
             self._flash("/case ID — начать прогон")
@@ -1270,9 +1284,19 @@ class TuiApp:
         if not case:
             self._flash("не нашёл такой кейс")
             return
-        session_id = self.store.create_session(
-            f"кейс #{case.id}: {case.situation[:50]}"
+        title = f"кейс #{case.id}: {case.situation[:50]}"
+        can_reuse = (
+            reuse_empty
+            and not self.store.is_session_closed(self.session_id)
+            and not self.store.messages(
+                self.session_id, include_hidden=True
+            )
         )
+        if can_reuse:
+            session_id = self.session_id
+            self.store.set_session_title(session_id, title)
+        else:
+            session_id = self.store.create_session(title)
         run = self.store.start_run(case, session_id)
         self.session_id = session_id
         self.active_run = run
@@ -1291,6 +1315,48 @@ class TuiApp:
         self.app.create_background_task(
             self._case_reply("case_opening", hidden.id)
         )
+
+    def _start_new_case(self, case: Any) -> None:
+        pending = self.active_run or self.store.latest_active_run()
+        if pending:
+            self.active_run = pending
+            self._flash(
+                f"кейс #{case.id} добавлен; есть прогон #{pending.id} — "
+                "/finish или /abandon"
+            )
+            return
+        self._case_start(str(case.id), reuse_empty=True)
+
+    def _case_add_only(self, text: str) -> None:
+        try:
+            case = self.store.add_case(text)
+        except ValueError as exc:
+            self._flash(str(exc)[:100])
+            return
+        self._flash(
+            f"кейс #{case.id} добавлен; /case {case.id} — играть"
+        )
+
+    def _archive_case(
+        self, case_id: int, include_archived: bool
+    ) -> None:
+        if self.active_run and self.active_run.case_id == case_id:
+            self._flash("этот кейс сейчас играется; /finish сначала")
+            return
+        if self.store.archive_case(case_id):
+            self._flash(f"кейс #{case_id} архивирован")
+            self._cases_modal(include_archived)
+        else:
+            self._flash("кейс уже в архиве")
+
+    def _restore_case(
+        self, case_id: int, include_archived: bool
+    ) -> None:
+        if self.store.set_case_status(case_id, "new"):
+            self._flash(f"кейс #{case_id} восстановлен")
+            self._cases_modal(include_archived)
+        else:
+            self._flash("не нашёл такой кейс")
 
     async def _case_reply(
         self, kind: str, cleanup_on_skip: int | None
@@ -1999,16 +2065,120 @@ class TuiApp:
         if not cases:
             self._flash("кейсов нет")
             return
+        items: list[tuple[Any, ...]] = []
+        for case in cases:
+            stats = self.store.run_stats(case.id)
+            label = (
+                f"#{case.id}  {case.status}  "
+                f"{' '.join(case.situation.split())[:44]}"
+            )
+            if stats["total"]:
+                label += (
+                    f"  · {stats['total']} прогонов"
+                    f" · лучшая {stats['best'] or '—'}"
+                )
+            items.append(
+                (
+                    label,
+                    lambda case_id=case.id, inc=include_archived: (
+                        self._show_case_detail(case_id, inc)
+                    ),
+                )
+            )
         self._open_modal(
             "кейсы",
-            [
+            items,
+            hint="↑/↓ — выбор · Enter — открыть · Esc — назад",
+        )
+
+    def _show_case_detail(
+        self, case_id: int, include_archived: bool = False
+    ) -> None:
+        case = self.store.get_case(case_id)
+        if not case:
+            self._flash("не нашёл такой кейс")
+            return
+        stats = self.store.run_stats(case_id)
+        average = stats["average"]
+        average_text = f"{average:.1f}" if average is not None else "—"
+        items: list[tuple[Any, ...]] = [
+            (f"статус: {case.status}", None, "info"),
+            (f"ситуация: {case.situation}", None, "info"),
+        ]
+        for label, value in (
+            ("отношения", case.relationship),
+            ("её цель", case.her_goal),
+            ("тон", case.tone),
+            ("нельзя", case.restrictions),
+            ("теги", case.tags),
+        ):
+            if value:
+                items.append((f"{label}: {value}", None, "info"))
+        items.append(
+            (
+                f"начинает: {'она' if case.opener == 'her' else 'ты'}",
+                None,
+                "info",
+            )
+        )
+        items.append(
+            (
+                f"прогоны: {stats['total']} · "
+                f"завершено {stats['finished']} · "
+                f"лучшая {stats['best'] or '—'} · "
+                f"средняя {average_text}",
+                None,
+                "info",
+            )
+        )
+        items.append(("----- действия -----", None, "header"))
+        items.append(
+            (
+                "начать прогон",
+                lambda: self._case_start(str(case_id)),
+            )
+        )
+        items.append(
+            (
+                "редактировать",
+                lambda: self._case_edit(str(case_id)),
+            )
+        )
+        if case.status == "archived":
+            items.append(
                 (
-                    f"#{case.id}  {case.status}  "
-                    f"{' '.join(case.situation.split())[:50]}",
-                    None,
+                    "восстановить",
+                    lambda: self._restore_case(
+                        case_id, include_archived
+                    ),
                 )
-                for case in cases
-            ],
+            )
+        else:
+            items.append(
+                (
+                    "заархивировать",
+                    lambda: self._archive_case(
+                        case_id, include_archived
+                    ),
+                )
+            )
+        items.append(
+            (
+                "удалить навсегда",
+                lambda: self._case_purge(str(case_id)),
+            )
+        )
+        items.append(
+            (
+                "назад к списку",
+                lambda: self._cases_modal(include_archived),
+            )
+        )
+        self._open_modal(
+            f"кейс #{case.id}",
+            items,
+            hint="↑/↓ — выбор · Enter — действие · Esc — назад",
+            on_escape=lambda: self._cases_modal(include_archived),
         )
 
     def _forget(self, text: str) -> None:
