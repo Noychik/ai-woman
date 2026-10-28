@@ -416,16 +416,34 @@ class TuiApp:
             if needle in item[0].lower()
         ]
 
+    def _modal_viewport(self) -> int:
+        try:
+            rows = self.app.output.get_size().rows
+        except Exception:  # noqa: BLE001
+            rows = 24
+        # Поля Float (top/bottom), заголовок и строка подсказки.
+        return max(6, min(rows - 8, 32))
+
     def _modal_text(self) -> Any:
         lines: list[Any] = [("class:sidebar.active", f" {self.modal_title}\n"), ("", "\n")]
         items = self._filtered_items()
         if not items:
             lines.append(("class:help", "  (ничего не найдено)\n"))
-        for index, (label, _) in enumerate(items[:40]):
-            mark = ">" if index == self.modal_sel else " "
-            style = "class:sidebar.active" if index == self.modal_sel else ""
-            lines.append((style, f" {mark} {label}\n"))
-        lines.append(("class:help", "\n Enter — выбрать · Esc — назад"))
+            lines.append(("class:help", "\n Esc — назад"))
+            return lines
+        viewport = self._modal_viewport()
+        sel = min(self.modal_sel, len(items) - 1)
+        start = max(0, min(sel - viewport // 2, len(items) - viewport))
+        end = min(len(items), start + viewport)
+        if start > 0:
+            lines.append(("class:help", "  … выше …\n"))
+        for index in range(start, end):
+            mark = ">" if index == sel else " "
+            style = "class:sidebar.active" if index == sel else ""
+            lines.append((style, f" {mark} {items[index][0]}\n"))
+        if end < len(items):
+            lines.append(("class:help", "  … ниже …\n"))
+        lines.append(("class:help", "\n ↑/↓ — выбор · Enter — применить · Esc — назад"))
         return lines
 
     def _modal_run(self) -> None:
@@ -479,6 +497,7 @@ class TuiApp:
 
     def _help_items(self) -> list[tuple[str, Any]]:
         return [
+            ("— клавиши —", None),
             ("Enter — отправить сообщение", None),
             ("Alt+Enter — перенос строки во вводе", None),
             ("Tab — фокус: ввод → история → сессии", None),
@@ -488,9 +507,37 @@ class TuiApp:
             ("PageUp/PageDown, Home/End — прокрутка истории", None),
             ("Ctrl+←/→, Ctrl+W — по словам", None),
             ("Ctrl+C / Ctrl+Q — выход", None),
-            ("команды: /new, /sessions, /switch, /model, /help", None),
-            ("ещё: /again, /undo, /edit, /like, /facts, /variants", None),
-            ("кейсы (\\к, \\к+, \\ч) — в --no-tui", None),
+            ("— чат —", None),
+            ("/new [название] — новая сессия", None),
+            ("/sessions — список сессий", None),
+            ("/switch ID — переключиться на сессию", None),
+            ("/again — перегенерировать последний ответ", None),
+            ("/undo — удалить последний обмен", None),
+            ("/edit — править последний ответ (Enter — сохранить, Esc — отмена)", None),
+            ("/like | /dislike — оценка последнего ответа", None),
+            ("/variants N — N вариантов (0 — обычный поток)", None),
+            ("/temp X — температура 0–2", None),
+            ("/model [имя] — сменить или выбрать модель", None),
+            ("/history N — сколько сообщений показывать", None),
+            ("/export [md|jsonl] — выгрузить диалог", None),
+            ("/stats — статистика", None),
+            ("/quit — выход", None),
+            ("— память и персонаж —", None),
+            ("/remember текст — добавить факт", None),
+            ("/facts — показать факты", None),
+            ("/forget ID — убрать факт", None),
+            ("/compact — сжать историю в сводку", None),
+            ("/persona — карточка персонажа", None),
+            ("/persona edit — править карточку", None),
+            ("/persona reload — перечитать карточку", None),
+            ("— модель —", None),
+            ("/load — загрузить модель в память", None),
+            ("/unload — выгрузить модель", None),
+            ("/loaded — что загружено", None),
+            ("— кейсы —", None),
+            ("/case текст — добавить кейс", None),
+            ("/cases, /cases all — список кейсов", None),
+            ("прогон и правка кейсов — в --no-tui", None),
         ]
 
     def _open_help(self) -> None:
