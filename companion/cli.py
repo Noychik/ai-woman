@@ -229,6 +229,7 @@ class GenerationProgress:
 
     STAGE_LABELS = {
         "connecting": "подключение",
+        "load": "загрузка модели и обработка контекста",
         "prompt": "обработка контекста",
         "generation": "генерация",
         "done": "готово",
@@ -260,7 +261,7 @@ class GenerationProgress:
         if not self.enabled:
             return
         self.live = Live(
-            self._render(),
+            get_renderable=self._render,
             console=self.console,
             refresh_per_second=8,
             transient=self.transient,
@@ -339,18 +340,28 @@ class GenerationProgress:
             text.append(self.answer)
             text.append("\n")
         elapsed = time.perf_counter() - self.started
-        if self.stage in ("connecting", "prompt"):
+        if self.stage in ("connecting", "load", "prompt"):
             label = self.STAGE_LABELS.get(self.stage, self.stage)
             text.append(f"⏳ {label} · {elapsed:.0f} с", style="dim")
         elif self.stage == "error":
             text.append("✗ ошибка", style="red")
         else:
-            prefix = "⚡ генерация" if self.stage == "generation" else "✓ готово"
-            text.append(
-                f"{prefix} · {self._tps():.1f} ток/с · "
-                f"{self.tokens} токенов",
-                style="dim",
-            )
+            tps = self._tps()
+            if self.stage == "generation" and (
+                self.tokens < 3 or tps > 500
+            ):
+                text.append("⚡ генерация…", style="dim")
+            else:
+                prefix = (
+                    "⚡ генерация"
+                    if self.stage == "generation"
+                    else "✓ готово"
+                )
+                text.append(
+                    f"{prefix} · {tps:.1f} ток/с · "
+                    f"{self.tokens} токенов",
+                    style="dim",
+                )
         return text
 
 
