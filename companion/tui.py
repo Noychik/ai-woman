@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shlex
 import sys
 from typing import Any
 
@@ -28,7 +30,14 @@ from prompt_toolkit.widgets import TextArea
 from .cli import build_key_bindings, parse_id, persona_name
 from .config import Config
 from .llm import BaseLLM, LLMError, make_llm, strip_thinking
-from .prompt import build_messages as assemble_messages
+from .prompt import (
+    build_messages as assemble_messages,
+    expand_instruction,
+    parse_short_variants,
+    parse_summary,
+    short_variant_instruction,
+    summarization_messages,
+)
 from .store import Store
 
 
@@ -75,6 +84,8 @@ class TuiApp:
         self.sel_index = 0
         self.busy = False
         self.at_bottom = True
+        self.history_limit = TRANSCRIPT_LIMIT
+        self.edit_target_id: int | None = None
 
         self.stage = "ready"
         self.tps = 0.0
@@ -125,7 +136,13 @@ class TuiApp:
     # ── запуск ────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        self.app.run(pre_run=self._focus_input)
+        try:
+            self.app.run(pre_run=self._focus_input)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self.store.close()
 
     def _focus_input(self) -> None:
         self.app.layout.focus(self.input_area)
@@ -141,6 +158,8 @@ class TuiApp:
         return self.store.create_session("первый разговор")
 
     def _switch_session(self, session_id: int) -> None:
+        if self._busy_guard():
+            return
         if not self.store.get_session(session_id):
             return
         self.session_id = session_id
@@ -268,7 +287,7 @@ class TuiApp:
             include_hidden=False,
         )
         lines: list[tuple[str, str]] = []
-        for message in messages[-TRANSCRIPT_LIMIT:]:
+        for message in messages[-self.history_limit:]:
             role = "user" if message.role == "user" else "assistant"
             who = "ты" if message.role == "user" else self.name
             lines.append((role, f"{who} › {message.content}"))
@@ -302,11 +321,12 @@ class TuiApp:
 
     # ── сообщения для модели ──────────────────────────────────────────────
 
-    def _messages(self) -> list[dict[str, str]]:
-        summary = self.store.latest_summary(self.session_id)
+    def _messages(self, session_id: int | None = None) -> list[dict[str, str]]:
+        session_id = self.session_id if session_id is None else session_id
+        summary = self.store.latest_summary(session_id)
         after = summary.upto_message_id if summary else 0
         history = self.store.messages(
-            self.session_id,
+            session_id,
             after_id=after,
             limit=self.cfg.chat.history_messages,
             roles=("user", "assistant"),
@@ -333,20 +353,40 @@ class TuiApp:
         if not text:
             return
         if text.startswith("/") or text.startswith("\\"):
+            self.edit_target_id = None
             self._run_command(text)
+            return
+        if self.edit_target_id is not None:
+            self.store.update_message(self.edit_target_id, text)
+            self.edit_target_id = None
+            self._render_transcript()
+            self.invalidate()
+            self._flash("ответ исправлен")
             return
         if self.busy:
             self.hint = "подожди, идёт генерация"
             self.invalidate()
             return
-        self.store.add_message(self.session_id, "user", text)
+        session_id = self.session_id
+        self.store.add_message(session_id, "user", text)
         self._refresh_sessions()
         self._render_transcript()
-        self.app.create_background_task(self._generate())
+        if self.variants > 0:
+            self.app.create_background_task(
+                self._generate_variants(session_id)
+            )
+        else:
+            self.app.create_background_task(self._generate(session_id))
 
     def _flash(self, message: str) -> None:
         self.hint = message
         self.invalidate()
+
+    def _busy_guard(self) -> bool:
+        if self.busy:
+            self._flash("подожди, идёт генерация")
+            return True
+        return False
 
     # ── модальный список ──────────────────────────────────────────────────
 
@@ -446,10 +486,11 @@ class TuiApp:
             ("Ctrl+N — новая сессия", None),
             ("Ctrl+P — палитра команд", None),
             ("PageUp/PageDown, Home/End — прокрутка истории", None),
-            ("Ctrl+←/→, Ctrl+Backspace — по словам", None),
+            ("Ctrl+←/→, Ctrl+W — по словам", None),
             ("Ctrl+C / Ctrl+Q — выход", None),
             ("команды: /new, /sessions, /switch, /model, /help", None),
-            ("полный список команд — /help в --no-tui", None),
+            ("ещё: /again, /undo, /edit, /like, /facts, /variants", None),
+            ("кейсы (\\к, \\к+, \\ч) — в --no-tui", None),
         ]
 
     def _open_help(self) -> None:
@@ -472,6 +513,8 @@ class TuiApp:
         self._flash(f"режим: {self.mode}")
 
     def _new_session(self) -> None:
+        if self._busy_guard():
+            return
         self.session_id = self.store.create_session()
         self._refresh_sessions()
         self._render_transcript()
@@ -528,7 +571,91 @@ class TuiApp:
             path.write_text("\n".join(lines), encoding="utf-8")
         self._flash(f"экспорт: {path}")
 
-    async def _generate(self) -> None:
+    async def _generate(self, session_id: int | None = None) -> None:
+        session_id = self.session_id if session_id is None else session_id
+        await self._stream_and_save(self._messages(session_id), session_id)
+
+    def _with_instruction(
+        self, messages: list[dict[str, str]], instruction: str
+    ) -> list[dict[str, str]]:
+        result = [dict(message) for message in messages]
+        result[0]["content"] = (
+            result[0]["content"].rstrip() + "\n\n" + instruction
+        )
+        return result
+
+    async def _generate_variants(self, session_id: int | None = None) -> None:
+        session_id = self.session_id if session_id is None else session_id
+        self.busy = True
+        self.streaming = ""
+        self.streaming_active = False
+        self.stage = "generation"
+        self.tps = 0.0
+        self.tokens = 0
+        self.invalidate()
+
+        messages = self._with_instruction(
+            self._messages(session_id), short_variant_instruction()
+        )
+        loop = asyncio.get_running_loop()
+        self.llm.on_progress = lambda event: loop.call_soon_threadsafe(
+            self._on_progress, event
+        )
+        temps = self.cfg.chat.variant_temperatures or [self.temperature]
+        beats: list[str] = []
+        try:
+            for index in range(max(1, self.variants)):
+                raw = await asyncio.to_thread(
+                    self.llm.complete,
+                    messages,
+                    temperature=temps[index % len(temps)],
+                    max_tokens=self.cfg.chat.short_max_tokens,
+                )
+                parsed = parse_short_variants(raw, 1)
+                if parsed:
+                    beats.append(parsed[0])
+        except Exception as exc:  # noqa: BLE001
+            self.busy = False
+            self.stage = "error"
+            self.error = str(exc)
+            self.invalidate()
+            return
+        finally:
+            self.llm.on_progress = None
+
+        self.busy = False
+        self.stage = "ready"
+        self.invalidate()
+        if not beats:
+            self._flash("модель не дала заготовок")
+            return
+        items = [
+            (
+                f"{index + 1}. {beat}",
+                lambda beat=beat: self.app.create_background_task(
+                    self._expand(beat, session_id)
+                ),
+            )
+            for index, beat in enumerate(beats)
+        ]
+        self._open_modal("выберите заготовку", items)
+
+    async def _expand(
+        self, beat: str, session_id: int | None = None
+    ) -> None:
+        session_id = self.session_id if session_id is None else session_id
+        messages = self._with_instruction(
+            self._messages(session_id),
+            expand_instruction(beat, mode=self.mode),
+        )
+        await self._stream_and_save(messages, session_id)
+
+    async def _stream_and_save(
+        self,
+        messages: list[dict[str, str]],
+        session_id: int | None = None,
+    ) -> None:
+        session_id = self.session_id if session_id is None else session_id
         self.busy = True
         self.streaming = ""
         self.streaming_active = True
@@ -537,7 +664,6 @@ class TuiApp:
         self.tokens = 0
         self.invalidate()
 
-        messages = self._messages()
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
 
@@ -547,12 +673,10 @@ class TuiApp:
         self.llm.on_progress = on_progress
 
         def producer() -> None:
-            chunks: list[str] = []
             try:
                 for chunk in self.llm.stream(
                     messages, temperature=self.temperature
                 ):
-                    chunks.append(chunk)
                     loop.call_soon_threadsafe(queue.put_nowait, ("token", chunk))
                 loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
             except Exception as exc:  # noqa: BLE001
@@ -565,7 +689,8 @@ class TuiApp:
             item = await queue.get()
             if item[0] == "token":
                 self.streaming += item[1]
-                self._render_transcript()
+                if self.session_id == session_id:
+                    self._render_transcript()
                 self.invalidate()
             elif item[0] == "error":
                 error = str(item[1])
@@ -582,7 +707,8 @@ class TuiApp:
             self.error = error
             self.stage = "error"
             self.busy = False
-            self._render_transcript()
+            if self.session_id == session_id:
+                self._render_transcript()
             self.invalidate()
             return
 
@@ -590,11 +716,12 @@ class TuiApp:
         self.streaming_active = False
         self.streaming = ""
         if reply:
-            self.store.add_message(self.session_id, "assistant", reply)
+            self.store.add_message(session_id, "assistant", reply)
             self._refresh_sessions()
         self.busy = False
         self.stage = "ready"
-        self._render_transcript()
+        if self.session_id == session_id:
+            self._render_transcript()
         self.invalidate()
 
     def _on_progress(self, event: dict[str, Any]) -> None:
@@ -608,12 +735,220 @@ class TuiApp:
 
     # ── команды (базовые) ────────────────────────────────────────────────
 
+    def _again(self) -> None:
+        if self._busy_guard():
+            return
+        last = self.store.last_message(self.session_id)
+        if last and last.role == "assistant":
+            self.store.delete_message(last.id)
+        last = self.store.last_message(self.session_id)
+        if not last or last.role != "user":
+            self._flash("нечего повторять")
+            return
+        self._render_transcript()
+        self.invalidate()
+        session_id = self.session_id
+        if self.variants > 0:
+            self.app.create_background_task(
+                self._generate_variants(session_id)
+            )
+        else:
+            self.app.create_background_task(self._generate(session_id))
+
+    def _edit_persona(self, path: Any) -> None:
+        if self._busy_guard():
+            return
+        editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+        try:
+            self.app.run_system_command(
+                f"{editor} {shlex.quote(str(path))}",
+                wait_for_enter=True,
+                display_before_text="редактор персонажа",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._flash(f"не удалось открыть редактор: {exc}"[:100])
+            return
+        try:
+            self.persona = path.read_text(encoding="utf-8")
+            self.name = persona_name(self.persona)
+            self._render_transcript()
+            self._flash(f"персонаж обновлён: {self.name}")
+        except OSError as exc:
+            self._flash(str(exc)[:80])
+
+    def _case_command(self, arg: str) -> None:
+        arg = arg.strip()
+        if not arg:
+            self._flash("/case текст — добавить кейс; прогон — в --no-tui")
+            return
+        if arg.isdigit():
+            self._flash("прогон кейса пока в --no-tui")
+            return
+        lowered = arg.lower()
+        if lowered in ("del", "delete", "purge", "gen", "suggest"):
+            self._flash("управление кейсами — в --no-tui")
+            return
+        try:
+            case = self.store.add_case(arg)
+        except ValueError as exc:
+            self._flash(str(exc)[:100])
+            return
+        self._flash(f"кейс #{case.id} добавлен; дополнить — в --no-tui")
+
+    def _begin_edit_last(self) -> None:
+        message = self.store.last_message(self.session_id, "assistant")
+        if not message:
+            self._flash("нет ответа для правки")
+            return
+        self.edit_target_id = message.id
+        self.input_area.text = message.content
+        self.input_area.buffer.cursor_position = len(message.content)
+        self.app.layout.focus(self.input_area)
+        self._flash("Enter — сохранить, Esc — отмена")
+
+    def _cancel_edit(self) -> None:
+        self.edit_target_id = None
+        self.input_area.buffer.reset()
+        self._flash("отменено")
+
+    def _rate(self, value: int) -> None:
+        message = self.store.last_message(self.session_id, "assistant")
+        if not message:
+            self._flash("нет ответа для оценки")
+            return
+        self._log(
+            {
+                "type": "rating",
+                "session_id": self.session_id,
+                "model": self.llm.cfg.model,
+                "response": message.content,
+                "rating": value,
+            }
+        )
+        self._flash("оценка записана")
+
+    def _log(self, record: dict[str, Any]) -> None:
+        path = self.cfg.path(self.cfg.paths.preferences)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+
+        record = {"ts": datetime.now().astimezone().isoformat(), **record}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _remember(self, text: str) -> None:
+        if not text:
+            self._flash("что запомнить?")
+            return
+        fact_id = self.store.add_fact(text)
+        self._flash(f"факт #{fact_id}" if fact_id else "пусто")
+
+    def _facts_modal(self) -> None:
+        facts = self.store.facts()
+        if not facts:
+            self._flash("фактов нет")
+            return
+        self._open_modal(
+            "факты", [(f"#{fact.id}  {fact.text}", None) for fact in facts]
+        )
+
+    def _cases_modal(self, include_archived: bool = False) -> None:
+        cases = self.store.cases(include_archived=include_archived)
+        if not cases:
+            self._flash("кейсов нет")
+            return
+        self._open_modal(
+            "кейсы",
+            [
+                (
+                    f"#{case.id}  {case.status}  "
+                    f"{' '.join(case.situation.split())[:50]}",
+                    None,
+                )
+                for case in cases
+            ],
+        )
+
+    def _forget(self, text: str) -> None:
+        fact_id = parse_id(text)
+        if fact_id is None:
+            self._flash("/forget ID")
+            return
+        if self.store.deactivate_fact(fact_id):
+            self._flash(f"факт #{fact_id} убран")
+        else:
+            self._flash("не нашёл факт")
+
+    async def _compact(self) -> None:
+        session_id = self.session_id
+        summary = self.store.latest_summary(session_id)
+        after = summary.upto_message_id if summary else 0
+        messages = self.store.messages(
+            session_id,
+            after_id=after,
+            roles=("user", "assistant"),
+            include_hidden=False,
+        )
+        keep = max(6, self.cfg.chat.history_messages // 2)
+        if len(messages) <= keep:
+            self._flash("нечего сжимать")
+            return
+        to_summarize = messages[:-keep]
+        if len(to_summarize) < 4:
+            self._flash("слишком мало сообщений")
+            return
+        transcript = "\n".join(
+            f"{'Он' if message.role == 'user' else 'Она'}: {message.content}"
+            for message in to_summarize
+        )
+        prompt = summarization_messages(
+            transcript,
+            previous_summary=summary.text if summary else None,
+        )
+        self.busy = True
+        self.stage = "prompt"
+        self.invalidate()
+        loop = asyncio.get_running_loop()
+        self.llm.on_progress = lambda event: loop.call_soon_threadsafe(
+            self._on_progress, event
+        )
+        try:
+            raw = await asyncio.to_thread(
+                self.llm.complete,
+                prompt,
+                temperature=0.3,
+                max_tokens=700,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.busy = False
+            self.stage = "error"
+            self.error = str(exc)
+            self.invalidate()
+            return
+        finally:
+            self.llm.on_progress = None
+        text, facts = parse_summary(raw)
+        if text:
+            self.store.add_summary(
+                session_id, to_summarize[-1].id, text
+            )
+            for fact in facts:
+                self.store.add_fact(fact)
+            self._flash("память обновлена")
+        else:
+            self._flash("модель вернула пустую сводку")
+        self.busy = False
+        self.stage = "ready"
+        self.invalidate()
+
     def _run_command(self, text: str) -> None:
         name = text.split(" ", 1)[0].lower()
         if name in ("/quit", "/exit", "/q", "\\й"):
             self.app.exit()
             return
         if name in ("/new", "\\т"):
+            if self._busy_guard():
+                return
             title = text.split(" ", 1)[1] if " " in text else None
             self.session_id = self.store.create_session(title)
             self._refresh_sessions()
@@ -626,6 +961,8 @@ class TuiApp:
             self.invalidate()
             return
         if name == "/switch":
+            if self._busy_guard():
+                return
             arg = text.split(" ", 1)[1] if " " in text else ""
             session_id = parse_id(arg)
             if session_id is not None:
@@ -638,7 +975,118 @@ class TuiApp:
         if name in ("/help", "\\р", "/h", "/?"):
             self._open_help()
             return
-        self._flash(f"команда {name} пока не в TUI")
+
+        arg = text.split(" ", 1)[1].strip() if " " in text else ""
+        if name in ("/again", "\\ф"):
+            self._again()
+        elif name == "/undo":
+            if self._busy_guard():
+                return
+            deleted = self.store.delete_last_exchange(self.session_id)
+            self._render_transcript()
+            self._flash(f"удалено сообщений: {deleted}")
+        elif name == "/edit":
+            if self._busy_guard():
+                return
+            self._begin_edit_last()
+        elif name in ("/like", "\\д"):
+            self._rate(1)
+        elif name in ("/dislike", "\\не"):
+            self._rate(-1)
+        elif name == "/remember":
+            self._remember(arg)
+        elif name in ("/facts", "\\а"):
+            self._facts_modal()
+        elif name == "/forget":
+            self._forget(arg)
+        elif name == "/compact":
+            if self._busy_guard():
+                return
+            self.app.create_background_task(self._compact())
+        elif name == "/persona":
+            path = self.cfg.path(self.cfg.paths.persona)
+            if arg in ("reload", "перечитать"):
+                try:
+                    self.persona = path.read_text(encoding="utf-8")
+                    self.name = persona_name(self.persona)
+                    self._render_transcript()
+                    self._flash(f"персонаж перечитан: {self.name}")
+                except OSError as exc:
+                    self._flash(str(exc)[:80])
+            elif arg in ("edit", "редактировать"):
+                self._edit_persona(path)
+            else:
+                self._flash(f"персонаж: {self.name} · {path}")
+        elif name == "/temp":
+            try:
+                self.temperature = max(0.0, min(2.0, float(arg)))
+                self._flash(f"температура: {self.temperature:.2f}")
+            except ValueError:
+                self._flash("/temp 0.85")
+        elif name == "/variants":
+            try:
+                self.variants = max(0, min(8, int(arg)))
+                self._flash(
+                    "варианты выключены"
+                    if self.variants == 0
+                    else f"вариантов: {self.variants}"
+                )
+            except ValueError:
+                self._flash("/variants 3")
+        elif name == "/model":
+            if arg:
+                self._set_model(arg)
+            else:
+                self._model_menu()
+        elif name == "/load":
+            if not self._busy_guard():
+                self._load_model()
+        elif name == "/unload":
+            if not self._busy_guard():
+                self._unload_model()
+        elif name == "/loaded":
+            loaded = self.llm.loaded_models()
+            if loaded:
+                total = sum(
+                    int(model.get("size") or 0) for model in loaded
+                )
+                self._flash(
+                    f"в памяти: {len(loaded)} · {total / 1024**3:.1f} ГБ"
+                )
+            else:
+                self._flash("модель не загружена")
+        elif name == "/export":
+            self._export(arg or "md")
+        elif name == "/stats":
+            self._stats_hint()
+        elif name == "/history":
+            try:
+                self.history_limit = max(4, min(200, int(arg)))
+                self._render_transcript()
+                self._flash(f"история: {self.history_limit}")
+            except ValueError:
+                self._flash("/history 40")
+        elif name in ("/cases", "\\ксы"):
+            self._cases_modal(
+                include_archived=arg.lower() in ("all", "архив", "archive")
+            )
+        elif name == "/case":
+            self._case_command(arg)
+        elif name in (
+            "/case_edit",
+            "/case_suggest",
+            "/finish",
+            "/resume",
+            "/hint",
+            "/abandon",
+            "\\к",
+            "\\ч",
+            "\\п",
+            "\\пд",
+        ):
+            self._flash("кейсы и прогоны пока в --no-tui")
+        else:
+            self._flash(f"не знаю команду {name}")
 
     # ── клавиши ───────────────────────────────────────────────────────────
 
@@ -680,6 +1128,8 @@ class TuiApp:
 
         @kb.add(Keys.ControlN)
         def _(event) -> None:
+            if self._busy_guard():
+                return
             self.session_id = self.store.create_session()
             self._refresh_sessions()
             self._render_transcript()
@@ -738,6 +1188,14 @@ class TuiApp:
         @kb.add("<any>", filter=modal, eager=True)
         def _(event) -> None:
             self._modal_filter_char(event.data)
+
+        @kb.add(
+            "escape",
+            filter=Condition(lambda: self.edit_target_id is not None),
+            eager=True,
+        )
+        def _cancel_edit(event) -> None:
+            self._cancel_edit()
 
         return kb
 
