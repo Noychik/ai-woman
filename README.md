@@ -89,7 +89,7 @@ systemctl --user status ollama
 | `Ctrl+N` | новая сессия |
 | `Ctrl+P` | палитра команд |
 | `PageUp` / `PageDown`, `Home` / `End` | прокрутка истории |
-| `Ctrl+←` / `Ctrl+→`, `Ctrl+Backspace` | редактирование по словам |
+| `Ctrl+←` / `Ctrl+→`, `Ctrl+W` | редактирование по словам |
 | `Ctrl+C` / `Ctrl+Q` | выход |
 
 В статусной строке: модель, режим, сессия и живой этап генерации
@@ -97,10 +97,13 @@ systemctl --user status ollama
 
 Текстовые команды (`/help`, `/new`, `/sessions`, `/switch`, `/model`, …)
 работают и в TUI. Палитра команд (`Ctrl+P`) дублирует основные из них.
+В TUI также работают `/again`, `/undo`, `/edit`, `/like`, `/dislike`,
+`/remember`, `/facts`, `/forget`, `/compact`, `/variants`, `/history`,
+`/temp`, `/export` и `/stats`.
 
-Известные ограничения первой версии TUI: варианты ответов и полный цикл
-кейсов (`\к`, `\к+`, `\ч`) пока живут в линейном режиме — для них используй
-`--no-tui`.
+Известное ограничение TUI: полный цикл кейсов (`\к`, `\к+`, `\ч`) пока
+живёт в линейном режиме — для него используй `--no-tui`. Список кейсов
+можно посмотреть через `/cases`.
 
 ## Модели
 
@@ -301,13 +304,30 @@ short_max_tokens = 60
 | Клавиши | Действие |
 |---|---|
 | `Ctrl + ←` / `Ctrl + →` | на слово влево/вправо |
-| `Ctrl + Backspace` | удалить слово слева |
+| `Ctrl + Backspace` | удалить слово слева (если терминал шлёт `ESC+DEL`) |
 | `Ctrl + Delete` | удалить слово справа |
 | `Home` / `End` | начало/конец строки |
 | `Ctrl + Home` / `Ctrl + End` | начало/конец всего ввода |
 | `Ctrl + A` / `Ctrl + E` | начало/конец строки |
 | `Ctrl + U` / `Ctrl + K` | удалить до/после курсора |
-| `Ctrl + W` | удалить слово слева |
+| `Ctrl + W` | удалить слово слева (работает всегда) |
+
+### Alacritty и Ctrl+Backspace
+
+`prompt_toolkit` не различает обычный Backspace и `Ctrl+H`/`Ctrl+Backspace`:
+для него это один ключ. Если Alacritty присылает `Ctrl+Backspace` как `\x08`,
+приложение удалит один символ. Чтобы `Ctrl+Backspace` удалял слово, добавь
+в `~/.config/alacritty/alacritty.toml`:
+
+```toml
+[[keyboard.bindings]]
+key = "Backspace"
+mods = "Control"
+chars = "\u001b\u007f"
+```
+
+После этого `Ctrl+Backspace` приходит как `ESC+DEL`, и приложение удаляет
+слово. `Ctrl+W` работает без настройки.
 
 ## Команды
 

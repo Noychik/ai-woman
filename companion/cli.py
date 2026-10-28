@@ -230,14 +230,21 @@ def parse_id(raw: str) -> int | None:
 def build_key_bindings() -> KeyBindings:
     kb = KeyBindings()
 
-    # Обычный Backspace всегда удаляет один символ, независимо от того,
-    # как терминал его кодирует (\x7f или \x08 = ControlH).
+    # В prompt_toolkit Backspace и ControlH — один и тот же ключ,
+    # поэтому здесь всегда удаляется ровно один символ.
     @kb.add(Keys.Backspace)
-    @kb.add(Keys.ControlH)
     def _delete_char(event) -> None:
         buff = event.current_buffer
         if buff.document.cursor_position:
             buff.delete_before_cursor(count=1)
+
+    @kb.add("c-w")
+    @kb.add("escape", Keys.Backspace)
+    def _delete_word_left(event) -> None:
+        buff = event.current_buffer
+        offset = buff.document.find_previous_word_beginning(count=1)
+        if offset is not None:
+            buff.delete_before_cursor(count=-offset)
 
     @kb.add(Keys.ControlLeft)
     def _word_left(event) -> None:
@@ -253,21 +260,8 @@ def build_key_bindings() -> KeyBindings:
         if offset is not None:
             buff.cursor_position += offset
 
-    @kb.add("c-w")
-    def _delete_word_left_cw(event) -> None:
-        buff = event.current_buffer
-        offset = buff.document.find_previous_word_beginning(count=1)
-        if offset is not None:
-            buff.delete_before_cursor(count=-offset)
-
-    # Ctrl+Backspace во многих терминалах приходит как ESC + DEL (0x7f).
-    @kb.add("escape", Keys.Backspace)
-    def _delete_word_left_esc(event) -> None:
-        buff = event.current_buffer
-        offset = buff.document.find_previous_word_beginning(count=1)
-        if offset is not None:
-            buff.delete_before_cursor(count=-offset)
-
+    # Ctrl+Backspace в терминалах, которые шлют ESC + DEL (0x7f), и Ctrl+W
+    # удаляют слово слева. В Alacritty это настраивается отдельно — см. README.
     @kb.add(Keys.ControlDelete)
     def _delete_word_right(event) -> None:
         buff = event.current_buffer
