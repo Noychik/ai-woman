@@ -99,8 +99,9 @@ class TuiConstructionTests(unittest.TestCase):
             self.assertEqual(app.history_limit, 12)
             app._run_command("/temp 0.5")
             self.assertEqual(app.temperature, 0.5)
-            app._run_command("/case кейс про чай")
+            app._run_command("/case add кейс про чай")
             self.assertEqual(len(app.store.cases()), 1)
+            self.assertIsNone(app.active_run)
 
             session = app.session_id
             app.store.add_message(session, "user", "привет")
@@ -189,7 +190,7 @@ class TuiConstructionTests(unittest.TestCase):
                     "her_goal": "объяснение",
                     "tone": "серьёзный",
                     "restrictions": "не мириться",
-                    "opener": "her",
+                    "opener": "me",
                 },
                 "идея",
             )
@@ -205,7 +206,8 @@ class TuiConstructionTests(unittest.TestCase):
             self.assertEqual(len(cases), 1)
             self.assertEqual(cases[0].situation, "она ревнует")
             self.assertEqual(cases[0].relationship, "встречаетесь")
-            self.assertEqual(cases[0].opener, "her")
+            self.assertEqual(cases[0].opener, "me")
+            self.assertIsNotNone(app.active_run)
 
     def test_case_finish_and_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,6 +371,99 @@ class TuiConstructionTests(unittest.TestCase):
             ]
             self.assertEqual(len(closed), 1)
             self.assertTrue(closed[0]["closed"])
+
+    def test_new_case_autostarts_in_empty_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_app(Path(tmp))
+            self.addCleanup(app.close)
+            session = app.session_id
+            case = app.store.add_case("новая сцена", opener="me")
+
+            app._start_new_case(case)
+
+            self.assertEqual(app.session_id, session)
+            self.assertIsNotNone(app.active_run)
+            self.assertEqual(app.active_run.case_id, case.id)
+            self.assertEqual(app.store.get_case(case.id).status, "used")
+            self.assertEqual(
+                app.store.get_session(session)["title"],
+                f"кейс #{case.id}: новая сцена",
+            )
+
+    def test_new_case_creates_session_when_busy_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_app(Path(tmp))
+            self.addCleanup(app.close)
+            old_session = app.session_id
+            app.store.add_message(old_session, "user", "старое сообщение")
+            case = app.store.add_case("новая сцена", opener="me")
+
+            app._start_new_case(case)
+
+            self.assertNotEqual(app.session_id, old_session)
+            self.assertIsNotNone(app.active_run)
+            self.assertEqual(app.active_run.case_id, case.id)
+
+    def test_new_case_with_active_run_only_adds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_app(Path(tmp))
+            self.addCleanup(app.close)
+            first = app.store.add_case("первая сцена", opener="me")
+            app._start_new_case(first)
+            active = app.active_run
+            self.assertIsNotNone(active)
+
+            second = app.store.add_case("вторая сцена", opener="me")
+            app._start_new_case(second)
+
+            self.assertEqual(app.active_run.id, active.id)
+            self.assertEqual(len(app.store.runs(case_id=second.id)), 0)
+
+    def test_case_detail_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_app(Path(tmp))
+            self.addCleanup(app.close)
+            case = app.store.add_case("сцена для деталей")
+
+            app._show_case_detail(case.id, include_archived=True)
+
+            self.assertTrue(app.modal_open)
+            labels = [item[0] for item in app.modal_items]
+            self.assertIn("начать прогон", labels)
+            self.assertIn("редактировать", labels)
+            self.assertIn("заархивировать", labels)
+            self.assertIn("удалить навсегда", labels)
+            self.assertIn("назад к списку", labels)
+            self.assertTrue(
+                any("сцена для деталей" in label for label in labels)
+            )
+
+            archive = next(
+                item[1] for item in app.modal_items
+                if item[0] == "заархивировать"
+            )
+            archive()
+            self.assertEqual(
+                app.store.get_case(case.id).status, "archived"
+            )
+
+    def test_case_detail_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = make_app(Path(tmp))
+            self.addCleanup(app.close)
+            case = app.store.add_case("архивная сцена")
+            app.store.archive_case(case.id)
+
+            app._show_case_detail(case.id, include_archived=True)
+            labels = [item[0] for item in app.modal_items]
+            self.assertIn("восстановить", labels)
+
+            restore = next(
+                item[1] for item in app.modal_items
+                if item[0] == "восстановить"
+            )
+            restore()
+            self.assertEqual(app.store.get_case(case.id).status, "new")
 
     def test_parse_hints(self) -> None:
         self.assertEqual(
