@@ -34,6 +34,40 @@ class TuiConstructionTests(unittest.TestCase):
             self.assertIsNotNone(app.session_id)
             self.assertIsNotNone(app.app)
 
+    def test_command_items_nonempty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "persona.md").write_text("# Алиса\n", encoding="utf-8")
+            cfg = Config(
+                root=root,
+                llm=LLMConfig(backend="mock", model="mock"),
+                chat=ChatConfig(),
+                paths=PathsConfig(),
+                memory=MemoryConfig(),
+                case=CaseConfig(),
+                content=ContentConfig(),
+            )
+            app = TuiApp(cfg)
+            self.assertGreater(len(app._command_items()), 5)
+
+    def test_modal_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "persona.md").write_text("# Алиса\n", encoding="utf-8")
+            cfg = Config(
+                root=root,
+                llm=LLMConfig(backend="mock", model="mock"),
+                chat=ChatConfig(),
+                paths=PathsConfig(),
+                memory=MemoryConfig(),
+                case=CaseConfig(),
+                content=ContentConfig(),
+            )
+            app = TuiApp(cfg)
+            app.modal_items = [("новая сессия", None), ("экспорт", None)]
+            app.modal_filter = "экспорт"
+            self.assertEqual(len(app._filtered_items()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

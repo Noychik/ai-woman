@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from typing import Any
 
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import has_focus
+from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout import (
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    Layout,
+    VSplit,
+    Window,
+)
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
@@ -74,6 +83,15 @@ class TuiApp:
         self.streaming_active = False
         self.error = ""
         self.hint = ""
+
+        self.modal_open = False
+        self.modal_title = ""
+        self.modal_items: list[tuple[str, Any]] = []
+        self.modal_filter = ""
+        self.modal_sel = 0
+        self.modal_control = FormattedTextControl(
+            self._modal_text, focusable=True
+        )
 
         self.transcript_buffer = Buffer(read_only=True, multiline=True)
         self.status_control = FormattedTextControl(self._status_text)
@@ -155,7 +173,27 @@ class TuiApp:
                 status,
             ]
         )
-        return VSplit([sidebar, right])
+        root = VSplit([sidebar, right])
+        modal = ConditionalContainer(
+            content=Window(
+                content=self.modal_control,
+                style="class:sidebar",
+                dont_extend_width=True,
+            ),
+            filter=Condition(lambda: self.modal_open),
+        )
+        return FloatContainer(
+            content=root,
+            floats=[
+                Float(
+                    content=modal,
+                    left=6,
+                    right=6,
+                    top=3,
+                    bottom=3,
+                )
+            ],
+        )
 
     # ── текст ─────────────────────────────────────────────────────────────
 
@@ -309,6 +347,170 @@ class TuiApp:
     def _flash(self, message: str) -> None:
         self.hint = message
         self.invalidate()
+
+    # ── модальный список ──────────────────────────────────────────────────
+
+    def _open_modal(self, title: str, items: list[tuple[str, Any]]) -> None:
+        self.modal_title = title
+        self.modal_items = items
+        self.modal_filter = ""
+        self.modal_sel = 0
+        self.modal_open = True
+        self.app.layout.focus(self.modal_control)
+        self.invalidate()
+
+    def _close_modal(self) -> None:
+        self.modal_open = False
+        self.modal_items = []
+        self.modal_filter = ""
+        self._focus_input()
+        self.invalidate()
+
+    def _filtered_items(self) -> list[tuple[str, Any]]:
+        needle = self.modal_filter.lower()
+        if not needle:
+            return self.modal_items
+        return [
+            item
+            for item in self.modal_items
+            if needle in item[0].lower()
+        ]
+
+    def _modal_text(self) -> Any:
+        lines: list[Any] = [("class:sidebar.active", f" {self.modal_title}\n"), ("", "\n")]
+        items = self._filtered_items()
+        if not items:
+            lines.append(("class:help", "  (ничего не найдено)\n"))
+        for index, (label, _) in enumerate(items[:40]):
+            mark = ">" if index == self.modal_sel else " "
+            style = "class:sidebar.active" if index == self.modal_sel else ""
+            lines.append((style, f" {mark} {label}\n"))
+        lines.append(("class:help", "\n Enter — выбрать · Esc — назад"))
+        return lines
+
+    def _modal_run(self) -> None:
+        items = self._filtered_items()
+        if not items:
+            return
+        action = items[min(self.modal_sel, len(items) - 1)][1]
+        self.modal_open = False
+        self._focus_input()
+        action()
+        self.invalidate()
+
+    def _modal_filter_char(self, char: str) -> None:
+        if char and char.isprintable():
+            self.modal_filter += char
+            self.modal_sel = 0
+            self.invalidate()
+
+    def _modal_backspace(self) -> None:
+        self.modal_filter = self.modal_filter[:-1]
+        self.modal_sel = 0
+        self.invalidate()
+
+    def _modal_move(self, delta: int) -> None:
+        items = self._filtered_items()
+        if not items:
+            return
+        self.modal_sel = (self.modal_sel + delta) % len(items)
+        self.invalidate()
+
+    # ── палитра команд ────────────────────────────────────────────────────
+
+    def _command_items(self) -> list[tuple[str, Any]]:
+        return [
+            ("новая сессия", self._new_session),
+            ("сессии (сайдбар)", lambda: self.app.layout.focus(self.session_control)),
+            ("выбор модели…", self._model_menu),
+            (f"режим: {self.mode} (переключить)", self._toggle_mode),
+            ("загрузить модель", self._load_model),
+            ("выгрузить модель", self._unload_model),
+            ("статистика", self._stats_hint),
+            ("экспорт markdown", lambda: self._export("md")),
+            ("экспорт jsonl", lambda: self._export("jsonl")),
+            ("помощь", self._help_hint),
+            ("выход", self.app.exit),
+        ]
+
+    def _open_palette(self) -> None:
+        self._open_modal("команды", self._command_items())
+
+    def _model_menu(self) -> None:
+        models = self.llm.list_models()
+        if not models:
+            models = [self.llm.cfg.model]
+        items = [(name, lambda name=name: self._set_model(name)) for name in models]
+        self._open_modal("модели", items)
+
+    def _set_model(self, name: str) -> None:
+        self.llm.cfg.model = name
+        self._flash(f"модель: {name}")
+
+    def _toggle_mode(self) -> None:
+        self.mode = "messaging" if self.mode == "roleplay" else "roleplay"
+        self.cfg.chat.mode = self.mode
+        self._flash(f"режим: {self.mode}")
+
+    def _new_session(self) -> None:
+        self.session_id = self.store.create_session()
+        self._refresh_sessions()
+        self._render_transcript()
+
+    def _load_model(self) -> None:
+        try:
+            self.llm.load_model()
+            self._flash("модель загружена")
+        except LLMError as exc:
+            self._flash(str(exc)[:80])
+
+    def _unload_model(self) -> None:
+        try:
+            self.llm.unload_model()
+            self._flash("модель выгружена")
+        except LLMError as exc:
+            self._flash(str(exc)[:80])
+
+    def _stats_hint(self) -> None:
+        runs = self.store.runs()
+        self._flash(
+            f"сессий {len(self.store.sessions())} · "
+            f"фактов {len(self.store.facts())} · "
+            f"кейсов {len(self.store.cases())} · "
+            f"прогонов {len(runs)}"
+        )
+
+    def _export(self, fmt: str) -> None:
+        messages = self.store.messages(
+            self.session_id, roles=("user", "assistant"), include_hidden=False
+        )
+        directory = self.cfg.path(self.cfg.paths.exports)
+        directory.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = directory / f"session_{self.session_id}_{stamp}.{fmt}"
+        if fmt == "jsonl":
+            with path.open("w", encoding="utf-8") as handle:
+                for message in messages:
+                    handle.write(
+                        json.dumps(
+                            {"role": message.role, "content": message.content},
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+        else:
+            lines = [f"# Сессия {self.session_id}", ""]
+            for message in messages:
+                who = "ты" if message.role == "user" else self.name
+                lines.append(f"**{who}:** {message.content}")
+                lines.append("")
+            path.write_text("\n".join(lines), encoding="utf-8")
+        self._flash(f"экспорт: {path}")
+
+    def _help_hint(self) -> None:
+        self._flash("Ctrl+P — команды · Tab — фокус · Ctrl+N — сессия · Ctrl+C — выход")
 
     async def _generate(self) -> None:
         self.busy = True
@@ -489,6 +691,37 @@ class TuiApp:
             self.transcript_buffer.cursor_position = len(
                 self.transcript_buffer.text
             )
+
+        modal = Condition(lambda: self.modal_open)
+
+        @kb.add(Keys.ControlP)
+        def _(event) -> None:
+            if not self.modal_open:
+                self._open_palette()
+
+        @kb.add("escape", filter=modal, eager=True)
+        def _(event) -> None:
+            self._close_modal()
+
+        @kb.add(Keys.Up, filter=modal, eager=True)
+        def _(event) -> None:
+            self._modal_move(-1)
+
+        @kb.add(Keys.Down, filter=modal, eager=True)
+        def _(event) -> None:
+            self._modal_move(1)
+
+        @kb.add("enter", filter=modal, eager=True)
+        def _(event) -> None:
+            self._modal_run()
+
+        @kb.add(Keys.Backspace, filter=modal, eager=True)
+        def _(event) -> None:
+            self._modal_backspace()
+
+        @kb.add("<any>", filter=modal, eager=True)
+        def _(event) -> None:
+            self._modal_filter_char(event.data)
 
         return kb
 
