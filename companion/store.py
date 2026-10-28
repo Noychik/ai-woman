@@ -98,7 +98,8 @@ BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     started_at TEXT NOT NULL,
-    title      TEXT
+    title      TEXT,
+    ended_at   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -193,6 +194,7 @@ class Store:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(BASE_SCHEMA)
+        self._migrate_sessions()
         self._migrate_cases()
         self.conn.executescript(RUNS_SCHEMA)
         self.conn.commit()
@@ -201,6 +203,15 @@ class Store:
         self.conn.close()
 
     # ── миграция ──────────────────────────────────────────────────────────
+
+    def _migrate_sessions(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(sessions)")
+        }
+        if "ended_at" not in columns:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN ended_at TEXT")
+            self.conn.commit()
 
     def _migrate_cases(self) -> None:
         exists = self.conn.execute(
@@ -275,12 +286,47 @@ class Store:
         ).fetchone()
         return int(row["id"]) if row else None
 
-    def sessions(self) -> list[sqlite3.Row]:
+    def latest_open_session(self) -> int | None:
+        row = self.conn.execute(
+            "SELECT id FROM sessions WHERE ended_at IS NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def is_session_closed(self, session_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT ended_at FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return bool(row and row["ended_at"])
+
+    def close_session(self, session_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE sessions SET ended_at = ? "
+            "WHERE id = ? AND ended_at IS NULL",
+            (utcnow(), session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def reopen_session(self, session_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE sessions SET ended_at = NULL "
+            "WHERE id = ? AND ended_at IS NOT NULL",
+            (session_id,),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def sessions(self, include_closed: bool = True) -> list[sqlite3.Row]:
+        where = "" if include_closed else "WHERE s.ended_at IS NULL "
         return self.conn.execute(
             "SELECT s.*, "
             "  (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS n, "
             "  (SELECT r.id FROM runs r WHERE r.session_id = s.id) AS run_id "
-            "FROM sessions s ORDER BY s.id DESC"
+            "FROM sessions s "
+            f"{where}"
+            "ORDER BY CASE WHEN s.ended_at IS NULL THEN 0 ELSE 1 END, "
+            "s.id DESC"
         ).fetchall()
 
     # ── сообщения ─────────────────────────────────────────────────────────
