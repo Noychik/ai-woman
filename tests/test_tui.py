@@ -147,6 +147,47 @@ class TuiConstructionTests(unittest.TestCase):
             find("/switch")()
             self.assertEqual(app.input_area.text, "/switch ")
 
+    def test_case_suggest_card_modal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "persona.md").write_text("# Алиса\n", encoding="utf-8")
+            cfg = Config(
+                root=root,
+                llm=LLMConfig(backend="mock", model="mock"),
+                chat=ChatConfig(),
+                paths=PathsConfig(),
+                memory=MemoryConfig(),
+                case=CaseConfig(),
+                content=ContentConfig(),
+            )
+            app = TuiApp(cfg)
+            self.addCleanup(app.close)
+
+            app._show_case_card(
+                {
+                    "situation": "она ревнует",
+                    "relationship": "встречаетесь",
+                    "her_goal": "объяснение",
+                    "tone": "серьёзный",
+                    "restrictions": "не мириться",
+                    "opener": "her",
+                },
+                "идея",
+            )
+            self.assertTrue(app.modal_open)
+
+            save = next(
+                item[1]
+                for item in app.modal_items
+                if item[0] == "сохранить кейс"
+            )
+            save()
+            cases = app.store.cases()
+            self.assertEqual(len(cases), 1)
+            self.assertEqual(cases[0].situation, "она ревнует")
+            self.assertEqual(cases[0].relationship, "встречаетесь")
+            self.assertEqual(cases[0].opener, "her")
+
 
 if __name__ == "__main__":
     unittest.main()

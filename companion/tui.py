@@ -27,12 +27,14 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from .cli import build_key_bindings, parse_id, persona_name
+from .cli import build_key_bindings, expand_alias, parse_id, persona_name
 from .config import Config
 from .llm import BaseLLM, LLMError, make_llm, strip_thinking
 from .prompt import (
     build_messages as assemble_messages,
+    case_suggestion_messages,
     expand_instruction,
+    parse_case_card,
     parse_short_variants,
     parse_summary,
     short_variant_instruction,
@@ -200,6 +202,7 @@ class TuiApp:
                 content=self.modal_control,
                 style="class:sidebar",
                 dont_extend_width=True,
+                wrap_lines=True,
             ),
             filter=Condition(lambda: self.modal_open),
         )
@@ -404,6 +407,7 @@ class TuiApp:
         self.modal_filter = ""
         self.modal_sel = 0
         self.modal_open = True
+        self._jump_to_first_selectable()
         self.app.layout.focus(self.modal_control)
         self.invalidate()
 
@@ -423,6 +427,18 @@ class TuiApp:
             for item in self.modal_items
             if needle in item[0].lower()
         ]
+
+    def _is_selectable(self, item: tuple[Any, ...]) -> bool:
+        kind = item[2] if len(item) > 2 else "item"
+        return kind not in ("header", "info")
+
+    def _jump_to_first_selectable(self) -> None:
+        items = self._filtered_items()
+        for index, item in enumerate(items):
+            if self._is_selectable(item):
+                self.modal_sel = index
+                return
+        self.modal_sel = 0
 
     def _modal_viewport(self) -> int:
         try:
@@ -454,6 +470,9 @@ class TuiApp:
                     lines.append(("", "\n"))
                 lines.append(("class:modal.header", f"  {label}\n"))
                 continue
+            if kind == "info":
+                lines.append(("class:help", f"   {label}\n"))
+                continue
             mark = ">" if index == sel else " "
             style = "class:sidebar.active" if index == sel else ""
             lines.append((style, f" {mark} {label}\n"))
@@ -466,7 +485,11 @@ class TuiApp:
         items = self._filtered_items()
         if not items:
             return
-        action = items[min(self.modal_sel, len(items) - 1)][1]
+        index = min(self.modal_sel, len(items) - 1)
+        item = items[index]
+        if not self._is_selectable(item):
+            return
+        action = item[1]
         self.modal_open = False
         self._focus_input()
         if callable(action):
@@ -476,19 +499,30 @@ class TuiApp:
     def _modal_filter_char(self, char: str) -> None:
         if char and char.isprintable():
             self.modal_filter += char
-            self.modal_sel = 0
+            self._jump_to_first_selectable()
             self.invalidate()
 
     def _modal_backspace(self) -> None:
         self.modal_filter = self.modal_filter[:-1]
-        self.modal_sel = 0
+        self._jump_to_first_selectable()
         self.invalidate()
 
     def _modal_move(self, delta: int) -> None:
         items = self._filtered_items()
         if not items:
             return
-        self.modal_sel = (self.modal_sel + delta) % len(items)
+        selectable = [
+            index
+            for index, item in enumerate(items)
+            if self._is_selectable(item)
+        ]
+        if not selectable:
+            return
+        if self.modal_sel in selectable:
+            position = selectable.index(self.modal_sel)
+        else:
+            position = -1 if delta > 0 else 0
+        self.modal_sel = selectable[(position + delta) % len(selectable)]
         self.invalidate()
 
     # ── палитра команд ────────────────────────────────────────────────────
@@ -562,6 +596,7 @@ class TuiApp:
             ("/loaded — что загружено", insert("/loaded")),
             ("----- кейсы -----", None, "header"),
             ("/case текст — добавить кейс", insert("/case ")),
+            ("/case suggest [идея] — модель предложит кейс", insert("/case suggest ")),
             ("/cases — список кейсов", insert("/cases")),
             ("/cases all — список с архивом", insert("/cases all")),
             ("прогон и правка кейсов — в --no-tui", None),
@@ -893,13 +928,19 @@ class TuiApp:
     def _case_command(self, arg: str) -> None:
         arg = arg.strip()
         if not arg:
-            self._flash("/case текст — добавить кейс; прогон — в --no-tui")
+            self._flash(
+                "/case текст — добавить · /case suggest — предложить"
+            )
             return
         if arg.isdigit():
             self._flash("прогон кейса пока в --no-tui")
             return
-        lowered = arg.lower()
-        if lowered in ("del", "delete", "purge", "gen", "suggest"):
+        action, _, rest = arg.partition(" ")
+        action_lower = action.lower()
+        if action_lower in ("suggest", "предложи", "придумай", "идея", "gen"):
+            self._case_suggest(rest.strip())
+            return
+        if action_lower in ("del", "delete", "purge", "+", "edit", "правка"):
             self._flash("управление кейсами — в --no-tui")
             return
         try:
@@ -908,6 +949,98 @@ class TuiApp:
             self._flash(str(exc)[:100])
             return
         self._flash(f"кейс #{case.id} добавлен; дополнить — в --no-tui")
+
+    def _case_suggest(self, seed: str) -> None:
+        if self._busy_guard():
+            return
+        self.app.create_background_task(
+            self._case_suggest_async(seed or None)
+        )
+
+    async def _case_suggest_async(
+        self, seed: str | None, exclude: list[str] | None = None
+    ) -> None:
+        self.busy = True
+        self.stage = "generation"
+        self.tps = 0.0
+        self.tokens = 0
+        self.invalidate()
+
+        existing = [
+            case.situation for case in self.store.cases(include_archived=True)
+        ]
+        if exclude:
+            existing.extend(exclude)
+        messages = case_suggestion_messages(
+            self.persona, seed, existing, adult=self.adult
+        )
+        loop = asyncio.get_running_loop()
+        self.llm.on_progress = lambda event: loop.call_soon_threadsafe(
+            self._on_progress, event
+        )
+        try:
+            raw = await asyncio.to_thread(
+                self.llm.complete,
+                messages,
+                temperature=0.9,
+                max_tokens=500,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.busy = False
+            self.stage = "error"
+            self.error = str(exc)
+            self.invalidate()
+            return
+        finally:
+            self.llm.on_progress = None
+
+        card = parse_case_card(raw)
+        self.busy = False
+        self.stage = "ready"
+        self.invalidate()
+        if not card:
+            self._flash("модель вернула не JSON — попробуй ещё раз")
+            return
+        self._show_case_card(card, seed)
+
+    def _show_case_card(
+        self, card: dict[str, str], seed: str | None
+    ) -> None:
+        def save() -> None:
+            fields = {key: value for key, value in card.items() if key != "situation"}
+            try:
+                case = self.store.add_case(card["situation"], **fields)
+            except ValueError as exc:
+                self._flash(str(exc)[:100])
+                return
+            self._flash(f"кейс #{case.id} добавлен")
+
+        def retry() -> None:
+            self.app.create_background_task(
+                self._case_suggest_async(seed, exclude=[card["situation"]])
+            )
+
+        items: list[tuple[Any, ...]] = [
+            ("ситуация: " + card["situation"], None, "info"),
+        ]
+        for label, key in (
+            ("отношения", "relationship"),
+            ("её цель", "her_goal"),
+            ("тон", "tone"),
+            ("нельзя", "restrictions"),
+        ):
+            value = card.get(key)
+            if value:
+                items.append((f"{label}: {value}", None, "info"))
+        items.append(("----- действия -----", None, "header"))
+        items.append(("сохранить кейс", save))
+        items.append(("заново", retry))
+        items.append(("отмена", None))
+        self._open_modal(
+            "предложение кейса",
+            items,
+            hint="↑/↓ — выбор · Enter — действие · Esc — назад",
+        )
 
     def _begin_edit_last(self) -> None:
         message = self.store.last_message(self.session_id, "assistant")
@@ -1056,6 +1189,8 @@ class TuiApp:
         self.invalidate()
 
     def _run_command(self, text: str) -> None:
+        if text.startswith("\\"):
+            text = expand_alias(text)
         name = text.split(" ", 1)[0].lower()
         if name in ("/quit", "/exit", "/q", "\\й"):
             self.app.exit()
@@ -1175,18 +1310,9 @@ class TuiApp:
             )
         elif name == "/case":
             self._case_command(arg)
-        elif name in (
-            "/case_edit",
-            "/case_suggest",
-            "/finish",
-            "/resume",
-            "/hint",
-            "/abandon",
-            "\\к",
-            "\\ч",
-            "\\п",
-            "\\пд",
-        ):
+        elif name == "/case_suggest":
+            self._case_suggest(arg)
+        elif name in ("/case_edit", "/finish", "/resume", "/hint", "/abandon"):
             self._flash("кейсы и прогоны пока в --no-tui")
         else:
             self._flash(f"не знаю команду {name}")
