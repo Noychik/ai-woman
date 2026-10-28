@@ -51,6 +51,7 @@ STYLE = Style.from_dict(
         "input": "bg:#1f2937",
         "help": "fg:#6b7280",
         "error": "fg:#f87171",
+        "modal.header": "bold",
     }
 )
 
@@ -97,7 +98,7 @@ class TuiApp:
 
         self.modal_open = False
         self.modal_title = ""
-        self.modal_items: list[tuple[str, Any]] = []
+        self.modal_items: list[tuple[Any, ...]] = []
         self.modal_filter = ""
         self.modal_sel = 0
         self.modal_control = FormattedTextControl(
@@ -390,7 +391,7 @@ class TuiApp:
 
     # ── модальный список ──────────────────────────────────────────────────
 
-    def _open_modal(self, title: str, items: list[tuple[str, Any]]) -> None:
+    def _open_modal(self, title: str, items: list[tuple[Any, ...]]) -> None:
         self.modal_title = title
         self.modal_items = items
         self.modal_filter = ""
@@ -406,7 +407,7 @@ class TuiApp:
         self._focus_input()
         self.invalidate()
 
-    def _filtered_items(self) -> list[tuple[str, Any]]:
+    def _filtered_items(self) -> list[tuple[Any, ...]]:
         needle = self.modal_filter.lower()
         if not needle:
             return self.modal_items
@@ -438,9 +439,17 @@ class TuiApp:
         if start > 0:
             lines.append(("class:help", "  … выше …\n"))
         for index in range(start, end):
+            item = items[index]
+            label = item[0]
+            kind = item[2] if len(item) > 2 else "item"
+            if kind == "header":
+                if index > start:
+                    lines.append(("", "\n"))
+                lines.append(("class:modal.header", f"  {label}\n"))
+                continue
             mark = ">" if index == sel else " "
             style = "class:sidebar.active" if index == sel else ""
-            lines.append((style, f" {mark} {items[index][0]}\n"))
+            lines.append((style, f" {mark} {label}\n"))
         if end < len(items):
             lines.append(("class:help", "  … ниже …\n"))
         lines.append(("class:help", "\n ↑/↓ — выбор · Enter — применить · Esc — назад"))
@@ -495,9 +504,9 @@ class TuiApp:
     def _open_palette(self) -> None:
         self._open_modal("команды", self._command_items())
 
-    def _help_items(self) -> list[tuple[str, Any]]:
+    def _help_items(self) -> list[tuple[Any, ...]]:
         return [
-            ("— клавиши —", None),
+            ("----- клавиши -----", None, "header"),
             ("Enter — отправить сообщение", None),
             ("Alt+Enter — перенос строки во вводе", None),
             ("Tab — фокус: ввод → история → сессии", None),
@@ -507,7 +516,7 @@ class TuiApp:
             ("PageUp/PageDown, Home/End — прокрутка истории", None),
             ("Ctrl+←/→, Ctrl+W — по словам", None),
             ("Ctrl+C / Ctrl+Q — выход", None),
-            ("— чат —", None),
+            ("----- чат -----", None, "header"),
             ("/new [название] — новая сессия", None),
             ("/sessions — список сессий", None),
             ("/switch ID — переключиться на сессию", None),
@@ -522,7 +531,7 @@ class TuiApp:
             ("/export [md|jsonl] — выгрузить диалог", None),
             ("/stats — статистика", None),
             ("/quit — выход", None),
-            ("— память и персонаж —", None),
+            ("----- память и персонаж -----", None, "header"),
             ("/remember текст — добавить факт", None),
             ("/facts — показать факты", None),
             ("/forget ID — убрать факт", None),
@@ -530,15 +539,16 @@ class TuiApp:
             ("/persona — карточка персонажа", None),
             ("/persona edit — править карточку", None),
             ("/persona reload — перечитать карточку", None),
-            ("— модель —", None),
+            ("----- модель -----", None, "header"),
             ("/load — загрузить модель в память", None),
             ("/unload — выгрузить модель", None),
             ("/loaded — что загружено", None),
-            ("— кейсы —", None),
+            ("----- кейсы -----", None, "header"),
             ("/case текст — добавить кейс", None),
             ("/cases, /cases all — список кейсов", None),
             ("прогон и правка кейсов — в --no-tui", None),
         ]
+
 
     def _open_help(self) -> None:
         self._open_modal("помощь (Esc — закрыть)", self._help_items())
@@ -1140,8 +1150,8 @@ class TuiApp:
     def _bindings(self) -> KeyBindings:
         kb = build_key_bindings()
 
-        @kb.add(Keys.ControlC)
-        @kb.add(Keys.ControlQ)
+        @kb.add(Keys.ControlC, eager=True)
+        @kb.add(Keys.ControlQ, eager=True)
         def _(event) -> None:
             event.app.exit()
 
