@@ -76,6 +76,9 @@ class CaseAndRunTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_snapshot_has_no_my_goal(self) -> None:
+        self.assertNotIn("my_goal", self.case.snapshot())
+
     def test_case_fields_and_update(self) -> None:
         self.assertEqual(self.case.relationship, "встречаемся три месяца")
         updated = self.store.update_case(self.case.id, tone="резкий", my_goal="не врать")
@@ -161,6 +164,21 @@ class ScenarioPromptTests(unittest.TestCase):
         self.assertIn("серьёзный", system)
         self.assertIn("объяснение", system)
         self.assertEqual(messages[1]["role"], "user")
+
+    def test_scenario_ignores_my_goal(self) -> None:
+        messages = build_messages(
+            persona="Ты — Алиса.",
+            facts=[],
+            summary=None,
+            history=[make_message(1, "user", "привет")],
+            max_chars=5000,
+            scenario={
+                "situation": "она ревнует",
+                "my_goal": "не ссориться",
+            },
+        )
+        self.assertNotIn("Его цель", messages[0]["content"])
+        self.assertNotIn("не ссориться", messages[0]["content"])
 
     def test_no_scenario_for_normal_chat(self) -> None:
         messages = build_messages(

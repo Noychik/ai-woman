@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
@@ -15,10 +16,12 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from .config import Config
 from .llm import (
@@ -221,6 +224,136 @@ def parse_id(raw: str) -> int | None:
     return int(raw) if raw.isdigit() else None
 
 
+class GenerationProgress:
+    """Живой статус: этап, токены и скорость прямо во время генерации."""
+
+    STAGE_LABELS = {
+        "connecting": "подключение",
+        "prompt": "обработка контекста",
+        "generation": "генерация",
+        "done": "готово",
+    }
+
+    def __init__(
+        self,
+        console: Console,
+        title: str = "",
+        show_answer: bool = False,
+        transient: bool = True,
+    ):
+        self.console = console
+        self.title = title
+        self.show_answer = show_answer
+        self.transient = transient
+        self.enabled = console.is_terminal
+        self.live: Live | None = None
+        self.answer = ""
+        self.stage = "connecting"
+        self.tokens = 0
+        self.tps = 0.0
+        self.started = time.perf_counter()
+        self.first_token_at: float | None = None
+        self.last_render = 0.0
+
+    def start(self) -> None:
+        self.started = time.perf_counter()
+        if not self.enabled:
+            return
+        self.live = Live(
+            self._render(),
+            console=self.console,
+            refresh_per_second=8,
+            transient=self.transient,
+            vertical_overflow="visible",
+        )
+        self.live.start()
+        self.last_render = time.perf_counter()
+
+    def on_event(self, event: dict) -> None:
+        stage = event.get("stage")
+        if stage:
+            self.stage = str(stage)
+        if event.get("tokens") is not None:
+            self.tokens = int(event["tokens"])
+        if event.get("tokens_per_second") is not None:
+            self.tps = float(event["tokens_per_second"])
+        if self.stage == "generation" and self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
+        self._refresh(force=self.stage == "done")
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        self.answer += chunk
+        if not self.enabled:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            return
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
+        self._refresh()
+
+    def finish(self, stats: GenerationStats | None) -> None:
+        if stats:
+            self.tokens = stats.tokens
+            self.tps = stats.tokens_per_second
+        self.stage = "done"
+        if self.live:
+            self.live.update(self._render())
+            self.live.stop()
+            self.live = None
+            if self.show_answer:
+                self.console.print()
+        elif self.show_answer:
+            self.console.print()
+            if stats:
+                tokens = (
+                    f"{self.tokens} "
+                    f"{plural(self.tokens, 'токен', 'токена', 'токенов')}"
+                )
+                self.console.print(
+                    f"[dim]⏱ {self.tps:.1f} ток/с · {tokens}[/]"
+                )
+
+    def _refresh(self, force: bool = False) -> None:
+        if not self.live:
+            return
+        now = time.perf_counter()
+        if not force and now - self.last_render < 0.12:
+            return
+        self.last_render = now
+        self.live.update(self._render())
+
+    def _tps(self) -> float:
+        if self.tps:
+            return self.tps
+        if self.first_token_at and self.tokens:
+            elapsed = max(0.001, time.perf_counter() - self.first_token_at)
+            return self.tokens / elapsed
+        return 0.0
+
+    def _render(self) -> Text:
+        text = Text()
+        if self.show_answer:
+            text.append(f"{self.title} › ", style="bold magenta")
+            text.append(self.answer)
+            text.append("\n")
+        elapsed = time.perf_counter() - self.started
+        if self.stage in ("connecting", "prompt"):
+            label = self.STAGE_LABELS.get(self.stage, self.stage)
+            text.append(f"⏳ {label} · {elapsed:.0f} с", style="dim")
+        elif self.stage == "error":
+            text.append("✗ ошибка", style="red")
+        else:
+            prefix = "⚡ генерация" if self.stage == "generation" else "✓ готово"
+            text.append(
+                f"{prefix} · {self._tps():.1f} ток/с · "
+                f"{self.tokens} токенов",
+                style="dim",
+            )
+        return text
+
+
 def plural(count: int, one: str, few: str, many: str) -> str:
     tail = count % 10
     if tail == 1 and count % 100 != 11:
@@ -310,6 +443,20 @@ class App:
 
     def _status(self, text: str):
         return self.console.status(text) if self.interactive else nullcontext()
+
+    def _complete_with_progress(
+        self, messages: list[dict[str, str]], **kwargs
+    ) -> str:
+        progress = GenerationProgress(
+            self.console, show_answer=False, transient=True
+        )
+        self.llm.on_progress = progress.on_event
+        progress.start()
+        try:
+            return self.llm.complete(messages, **kwargs)
+        finally:
+            self.llm.on_progress = None
+            progress.finish(self.llm.last_stats)
 
     def _print_speed(self, stats: GenerationStats | None) -> None:
         if not stats or stats.tokens_per_second <= 0:
@@ -526,12 +673,24 @@ class App:
     def _stream_reply(
         self, messages: list[dict[str, str]], warn_empty: bool = True
     ) -> str:
-        self.console.print(f"[bold magenta]{self.name} ›[/] ", end="")
+        progress = GenerationProgress(
+            self.console,
+            title=self.name,
+            show_answer=True,
+            transient=False,
+        )
+        if not progress.enabled:
+            sys.stdout.write(f"{self.name} › ")
+            sys.stdout.flush()
+        self.llm.on_progress = progress.on_event
+        progress.start()
         parts: list[str] = []
         buffer = ""
         started = False
         try:
-            for chunk in self.llm.stream(messages, temperature=self.temperature):
+            for chunk in self.llm.stream(
+                messages, temperature=self.temperature
+            ):
                 buffer += chunk
                 if not started:
                     if "</think>" in buffer:
@@ -545,18 +704,16 @@ class App:
                     buffer = buffer.lstrip()
                 if buffer:
                     parts.append(buffer)
-                    sys.stdout.write(buffer)
-                    sys.stdout.flush()
+                    progress.append(buffer)
                     buffer = ""
             if not started and buffer:
                 buffer = buffer.lstrip()
                 parts.append(buffer)
-                sys.stdout.write(buffer)
-                sys.stdout.flush()
+                progress.append(buffer)
         finally:
-            self.console.print()
+            self.llm.on_progress = None
+            progress.finish(self.llm.last_stats)
         reply = strip_thinking("".join(parts)).strip()
-        self._print_speed(self.llm.last_stats)
         if not reply and warn_empty:
             self.console.print("[yellow]Пустой ответ. Попробуй /again.[/]")
         return reply
@@ -632,13 +789,12 @@ class App:
                 self._messages_for_model(), short_variant_instruction()
             )
             temperature = temps[index % len(temps)]
-            with self._status(f"заготовка {index + 1}/{count}"):
-                raw = self.llm.complete(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=self.cfg.chat.short_max_tokens,
-                    seed=base + index,
-                )
+            raw = self._complete_with_progress(
+                messages,
+                temperature=temperature,
+                max_tokens=self.cfg.chat.short_max_tokens,
+                seed=base + index,
+            )
             parsed = parse_short_variants(raw, 1)
             if parsed:
                 beats.append(parsed[0])
@@ -774,10 +930,11 @@ class App:
         candidates: list[tuple[str, float, GenerationStats | None]] = []
         for index in range(count):
             temperature = temps[index % len(temps)]
-            with self._status(f"вариант {index + 1}/{count} · T={temperature:.2f}"):
-                text = self.llm.complete(
-                    messages, temperature=temperature, seed=base + index
-                )
+            text = self._complete_with_progress(
+                messages,
+                temperature=temperature,
+                seed=base + index,
+            )
             if text:
                 candidates.append((text, temperature, self.llm.last_stats))
         return candidates
@@ -914,15 +1071,14 @@ class App:
             f"[dim]сжимаю {len(to_summarize)} сообщений в память…[/]"
         )
         try:
-            with self._status("сводка"):
-                raw = self.llm.complete(
-                    summarization_messages(
-                        transcript,
-                        previous_summary=summary.text if summary else None,
-                    ),
-                    temperature=0.3,
-                    max_tokens=700,
-                )
+            raw = self._complete_with_progress(
+                summarization_messages(
+                    transcript,
+                    previous_summary=summary.text if summary else None,
+                ),
+                temperature=0.3,
+                max_tokens=700,
+            )
         except LLMError as exc:
             self.console.print(f"[red]Не удалось сжать: {exc}[/]")
             return
@@ -1048,10 +1204,9 @@ class App:
                 self.persona, seed, existing, adult=self.adult
             )
             try:
-                with self._status("придумываю кейс"):
-                    reply = self.llm.complete(
-                        messages, temperature=0.9, max_tokens=500
-                    )
+                reply = self._complete_with_progress(
+                    messages, temperature=0.9, max_tokens=500
+                )
             except LLMError as exc:
                 self.console.print(f"[red]{exc}[/]")
                 return
@@ -1101,7 +1256,6 @@ class App:
         fields = [
             ("отношения", "relationship"),
             ("её цель", "her_goal"),
-            ("твоя цель", "my_goal"),
             ("тон", "tone"),
             ("нельзя", "restrictions"),
         ]
@@ -1119,7 +1273,6 @@ class App:
             ("situation", "ситуация"),
             ("relationship", "отношения"),
             ("her_goal", "её цель"),
-            ("my_goal", "твоя цель"),
             ("tone", "тон"),
             ("restrictions", "нельзя"),
             ("opener", "кто начинает (her/me)"),
@@ -1205,7 +1358,6 @@ class App:
             ("situation", "ситуация"),
             ("relationship", "отношения"),
             ("her_goal", "её цель"),
-            ("my_goal", "твоя цель"),
             ("tone", "тон"),
             ("restrictions", "нельзя"),
             ("opener", "кто начинает (her/me)"),
@@ -1272,7 +1424,6 @@ class App:
         fields = [
             ("отношения", scenario.get("relationship")),
             ("её цель", scenario.get("her_goal")),
-            ("твоя цель", scenario.get("my_goal")),
             ("тон", scenario.get("tone")),
             ("нельзя", scenario.get("restrictions")),
         ]
@@ -1590,8 +1741,9 @@ class App:
             },
         ]
         try:
-            with self._status("подсказка"):
-                raw = self.llm.complete(prompt, temperature=0.9, max_tokens=300)
+            raw = self._complete_with_progress(
+                prompt, temperature=0.9, max_tokens=300
+            )
         except LLMError as exc:
             self.console.print(f"[red]{exc}[/]")
             return
@@ -1694,7 +1846,6 @@ class App:
             fields = [
                 ("Отношения", case.relationship),
                 ("Её цель", case.her_goal),
-                ("Твоя цель", case.my_goal),
                 ("Тон", case.tone),
                 ("Нельзя", case.restrictions),
                 ("Теги", case.tags),
