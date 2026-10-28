@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -136,6 +137,68 @@ class StoreTests(unittest.TestCase):
         deleted = self.store.delete_last_exchange(self.session)
         self.assertEqual(deleted, 1)
         self.assertEqual(self.store.count_messages(self.session), 0)
+
+class SessionCloseTests(unittest.TestCase):
+    def test_migrates_ended_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "chat.db"
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                """
+                CREATE TABLE sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    title TEXT
+                );
+                INSERT INTO sessions(started_at, title)
+                VALUES ('2026-01-01', 'старая');
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            store = Store(path)
+            try:
+                columns = {
+                    row["name"]
+                    for row in store.conn.execute("PRAGMA table_info(sessions)")
+                }
+                self.assertIn("ended_at", columns)
+                self.assertFalse(store.is_session_closed(1))
+            finally:
+                store.close()
+
+    def test_close_reopen_and_latest_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "chat.db")
+            try:
+                first = store.create_session("first")
+                second = store.create_session("second")
+                third = store.create_session("third")
+
+                self.assertEqual(store.latest_open_session(), third)
+                self.assertTrue(store.close_session(second))
+                self.assertFalse(store.close_session(second))
+                self.assertTrue(store.is_session_closed(second))
+
+                open_ids = [
+                    row["id"]
+                    for row in store.sessions(include_closed=False)
+                ]
+                self.assertEqual(open_ids, [third, first])
+                all_rows = {
+                    row["id"]: row
+                    for row in store.sessions(include_closed=True)
+                }
+                self.assertIn(second, all_rows)
+                self.assertTrue(all_rows[second]["ended_at"])
+
+                self.assertTrue(store.reopen_session(second))
+                self.assertFalse(store.reopen_session(second))
+                self.assertFalse(store.is_session_closed(second))
+                self.assertEqual(store.latest_open_session(), third)
+            finally:
+                store.close()
 
 
 class ThinkingTests(unittest.TestCase):

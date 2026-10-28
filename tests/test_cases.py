@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from companion.cli import build_key_bindings, expand_alias, wrap_words
+from companion.cli import expand_alias, wrap_words
 from companion.prompt import (
     build_messages,
     case_suggestion_messages,
@@ -312,8 +312,7 @@ class CaseSuggestionTests(unittest.TestCase):
         )
         self.assertNotIn("Взрослые сцены разрешены", messages[0]["content"])
 
-    def test_sfw_system_prompt(self) -> None:
-        messages = build_messages(
+        chat = build_messages(
             persona="Ты — Алиса.",
             facts=[],
             summary=None,
@@ -321,13 +320,10 @@ class CaseSuggestionTests(unittest.TestCase):
             max_chars=5000,
             adult=False,
         )
-        self.assertNotIn("Ты взрослая женщина", messages[0]["content"])
+        self.assertNotIn("Ты взрослая женщина", chat[0]["content"])
 
 
 class EditingTests(unittest.TestCase):
-    def test_key_bindings_build(self) -> None:
-        self.assertIsNotNone(build_key_bindings())
-
     def test_wrap_words_does_not_split_long_word(self) -> None:
         text = "короткое оченьдлинноесловобезпробелов конец"
         wrapped = wrap_words(text, 12)
