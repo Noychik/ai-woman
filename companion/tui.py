@@ -94,6 +94,10 @@ class TuiApp:
         self.seed_base = 0
 
         self.session_id = self._pick_session(session_id)
+        # Если открыли закрытую сессию явно (--session), покажем её в сайдбаре.
+        self.show_closed_sessions = self.store.is_session_closed(
+            self.session_id
+        )
         self.active_run: Run | None = self.store.active_run_for_session(
             self.session_id
         )
@@ -174,7 +178,7 @@ class TuiApp:
             if not self.store.get_session(session_id):
                 raise SystemExit(f"Сессии {session_id} нет.")
             return session_id
-        latest = self.store.latest_session()
+        latest = self.store.latest_open_session()
         if latest is not None:
             return latest
         return self.store.create_session("первый разговор")
@@ -185,11 +189,14 @@ class TuiApp:
         if not self.store.get_session(session_id):
             return
         self.session_id = session_id
+        self.active_run = self.store.active_run_for_session(session_id)
         self.at_bottom = True
         self.streaming_active = False
         self.streaming = ""
         self._refresh_sessions()
         self._render_transcript()
+        if self.store.is_session_closed(session_id):
+            self._flash(f"сессия {session_id} закрыта; /reopen {session_id}")
         self.invalidate()
 
     # ── layout ────────────────────────────────────────────────────────────
@@ -257,6 +264,8 @@ class TuiApp:
             parts.append(
                 ("class:status", f"кейс #{self.active_run.case_id} · ")
             )
+        if self.store.is_session_closed(self.session_id):
+            parts.append(("class:error", "закрыта · "))
         style = "class:error" if self.stage == "error" else "class:status"
         parts.append((style, state))
         if self.stage == "error" and self.error:
@@ -271,21 +280,30 @@ class TuiApp:
         lines: list[Any] = [("class:help", " сессии (Tab, ↑↓, Enter)\n")]
         for index, session in enumerate(self.sessions):
             mark = ">" if index == self.sel_index else " "
+            closed = session.get("closed")
             style = "class:sidebar.active" if index == self.sel_index else ""
+            if closed and index != self.sel_index:
+                style = "class:help"
             title = (session.get("title") or "разговор")[:18]
+            prefix = "✓ " if closed else ""
             preview = (session.get("preview") or "—")[:16]
-            lines.append((style, f"{mark} {session['id']:>3} {title}\n"))
+            lines.append(
+                (style, f"{mark} {session['id']:>3} {prefix}{title}\n")
+            )
             lines.append(("class:help", f"       {preview}\n"))
         return lines
 
     def _refresh_sessions(self) -> None:
-        rows = self.store.sessions()
+        rows = self.store.sessions(
+            include_closed=self.show_closed_sessions
+        )
         self.sessions = [
             {
                 "id": row["id"],
                 "title": row["title"] or "разговор",
                 "n": row["n"],
                 "run_id": row["run_id"],
+                "closed": bool(row["ended_at"]),
                 "preview": self._session_preview(row["id"]),
             }
             for row in rows
@@ -396,6 +414,8 @@ class TuiApp:
             self._render_transcript()
             self.invalidate()
             self._flash("ответ исправлен")
+            return
+        if self._closed_guard():
             return
         if self.busy:
             self.hint = "подожди, идёт генерация"
@@ -571,6 +591,10 @@ class TuiApp:
         return [
             ("новая сессия", self._new_session),
             ("сессии (сайдбар)", lambda: self.app.layout.focus(self.session_control)),
+            ("сессии: все", lambda: self._show_sessions(True)),
+            ("сессии: открытые", lambda: self._show_sessions(False)),
+            ("закрыть сессию", lambda: self._close_session("")),
+            ("открыть сессию…", lambda: self._insert_input("/reopen ")),
             ("выбор модели…", self._model_menu),
             (f"режим: {self.mode} (переключить)", self._toggle_mode),
             ("загрузить модель", self._load_model),
@@ -613,8 +637,11 @@ class TuiApp:
             ("Ctrl+C / Ctrl+Q — выход", None),
             ("----- чат -----", None, "header"),
             ("/new [название] — новая сессия", insert("/new ")),
-            ("/sessions — список сессий", insert("/sessions")),
+            ("/sessions — открытые сессии", insert("/sessions")),
+            ("/sessions all — вместе с закрытыми", insert("/sessions all")),
             ("/switch ID — переключиться на сессию", insert("/switch ")),
+            ("/close [ID] — закрыть сессию", insert("/close")),
+            ("/reopen ID — открыть закрытую сессию", insert("/reopen ")),
             ("/again — перегенерировать последний ответ", insert("/again")),
             ("/undo — удалить последний обмен", insert("/undo")),
             ("/edit — править последний ответ", insert("/edit")),
@@ -696,6 +723,85 @@ class TuiApp:
         self.session_id = self.store.create_session(title)
         self._refresh_sessions()
         self._render_transcript()
+
+    def _closed_guard(self) -> bool:
+        if self.store.is_session_closed(self.session_id):
+            self._flash(
+                f"сессия {self.session_id} закрыта; "
+                f"/reopen {self.session_id}"
+            )
+            return True
+        return False
+
+    def _show_sessions(self, include_closed: bool) -> None:
+        self.show_closed_sessions = include_closed
+        self._refresh_sessions()
+        self.app.layout.focus(self.session_control)
+        self.invalidate()
+
+    def _close_session(self, raw: str) -> None:
+        if self._busy_guard():
+            return
+        session_id = parse_id(raw) if raw else self.session_id
+        if session_id is None:
+            self._flash("/close [ID]")
+            return
+        if not self.store.get_session(session_id):
+            self._flash("не нашёл такую сессию")
+            return
+        if self.store.is_session_closed(session_id):
+            self._flash("сессия уже закрыта")
+            return
+        if self.active_run and self.active_run.session_id == session_id:
+            self._flash(
+                f"в сессии идёт прогон #{self.active_run.id}; "
+                "/finish или /abandon"
+            )
+            return
+
+        open_count = len(self.store.sessions(include_closed=False))
+        self.store.close_session(session_id)
+
+        if session_id != self.session_id:
+            self._refresh_sessions()
+            self._render_transcript()
+            self.invalidate()
+            self._flash(f"сессия {session_id} закрыта")
+            return
+
+        if open_count <= 1:
+            self.session_id = self.store.create_session("новая сессия")
+            self.active_run = None
+            self._flash("последняя открытая закрыта; создана новая")
+        else:
+            next_id = self.store.latest_open_session()
+            if next_id is None:
+                next_id = self.store.create_session("новая сессия")
+            self.session_id = next_id
+            self.active_run = self.store.active_run_for_session(next_id)
+            self._flash(f"сессия закрыта; открыта {next_id}")
+        self._refresh_sessions()
+        self._render_transcript()
+        self.invalidate()
+
+    def _reopen_session(self, raw: str) -> None:
+        if self._busy_guard():
+            return
+        session_id = parse_id(raw) if raw else self.session_id
+        if session_id is None:
+            self._flash("/reopen ID")
+            return
+        if not self.store.get_session(session_id):
+            self._flash("не нашёл такую сессию")
+            return
+        if self.store.reopen_session(session_id):
+            self.session_id = session_id
+            self.active_run = self.store.active_run_for_session(session_id)
+            self._refresh_sessions()
+            self._render_transcript()
+            self._flash(f"сессия {session_id} открыта")
+        else:
+            self._flash("сессия уже открыта")
 
     def _load_model(self) -> None:
         if self._busy_guard():
@@ -941,6 +1047,8 @@ class TuiApp:
 
     def _again(self) -> None:
         if self._busy_guard():
+            return
+        if self._closed_guard():
             return
         last = self.store.last_message(self.session_id)
         if last and last.role == "assistant":
@@ -1988,9 +2096,20 @@ class TuiApp:
             self.invalidate()
             return
         if name in ("/sessions", "/session", "\\ы"):
-            self._refresh_sessions()
-            self.app.layout.focus(self.session_control)
-            self.invalidate()
+            rest = text.split(" ", 1)[1].strip().lower() if " " in text else ""
+            self._show_sessions(
+                rest in ("all", "архив", "archive")
+            )
+            return
+        if name == "/close":
+            self._close_session(
+                text.split(" ", 1)[1].strip() if " " in text else ""
+            )
+            return
+        if name == "/reopen":
+            self._reopen_session(
+                text.split(" ", 1)[1].strip() if " " in text else ""
+            )
             return
         if name == "/switch":
             if self._busy_guard():
@@ -2014,11 +2133,15 @@ class TuiApp:
         elif name == "/undo":
             if self._busy_guard():
                 return
+            if self._closed_guard():
+                return
             deleted = self.store.delete_last_exchange(self.session_id)
             self._render_transcript()
             self._flash(f"удалено сообщений: {deleted}")
         elif name == "/edit":
             if self._busy_guard():
+                return
+            if self._closed_guard():
                 return
             self._begin_edit_last()
         elif name in ("/like", "\\д"):
@@ -2033,6 +2156,8 @@ class TuiApp:
             self._forget(arg)
         elif name == "/compact":
             if self._busy_guard():
+                return
+            if self._closed_guard():
                 return
             self.app.create_background_task(self._compact())
         elif name == "/persona":

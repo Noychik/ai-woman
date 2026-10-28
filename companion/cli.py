@@ -114,6 +114,10 @@ LATIN_ALIASES = {
     "case": "case",
     "ks": "cases",
     "cases": "cases",
+    "close": "close",
+    "end": "close",
+    "reopen": "reopen",
+    "open": "reopen",
     "finish": "finish",
     "resume": "resume",
     "hint": "hint",
@@ -155,6 +159,10 @@ RU_ALIASES = {
     "персонаж": "persona",
     "к": "case",
     "кейс": "case",
+    "зс": "close",
+    "закрыть": "close",
+    "открыть": "reopen",
+    "переоткрыть": "reopen",
     "к+": "case_edit",
     "кп": "case_suggest",
     "придумай": "case_suggest",
@@ -518,7 +526,7 @@ class App:
             if not self.store.get_session(session_id):
                 raise SystemExit(f"Сессии {session_id} нет.")
             return session_id
-        latest = self.store.latest_session()
+        latest = self.store.latest_open_session()
         if latest is not None:
             return latest
         return self.store.create_session("первый разговор")
@@ -600,6 +608,12 @@ class App:
                     self.console.print(f"[red]{exc}[/]")
                 except KeyboardInterrupt:
                     self.console.print("\n[yellow]прервано[/]")
+                continue
+            if self.store.is_session_closed(self.session_id):
+                self.console.print(
+                    f"[yellow]Сессия {self.session_id} закрыта. "
+                    f"/reopen {self.session_id} — открыть.[/]"
+                )
                 continue
             try:
                 if self.active_run:
@@ -1983,7 +1997,13 @@ class App:
         elif name == "/new":
             self._new_session(rest)
         elif name == "/sessions":
-            self._sessions()
+            self._sessions(
+                include_closed=rest.lower() in ("all", "архив", "archive")
+            )
+        elif name == "/close":
+            self._close_session(rest)
+        elif name == "/reopen":
+            self._reopen_session(rest)
         elif name == "/switch":
             self._switch(rest)
         elif name == "/variants":
@@ -2017,7 +2037,8 @@ class App:
         elif name == "/forget":
             self._forget(rest)
         elif name == "/compact":
-            self.summarize(force=True)
+            if not self._closed_session_guard():
+                self.summarize(force=True)
         elif name == "/case":
             self._case(rest)
         elif name == "/cases":
@@ -2037,12 +2058,17 @@ class App:
         elif name == "/abandon":
             self._abandon()
         elif name == "/again":
-            self.retry()
+            if not self._closed_session_guard():
+                self.retry()
         elif name == "/undo":
-            deleted = self.store.delete_last_exchange(self.session_id)
-            self.console.print(f"[green]✓ удалено сообщений: {deleted}[/]")
+            if not self._closed_session_guard():
+                deleted = self.store.delete_last_exchange(self.session_id)
+                self.console.print(
+                    f"[green]✓ удалено сообщений: {deleted}[/]"
+                )
         elif name == "/edit":
-            self._edit_last()
+            if not self._closed_session_guard():
+                self._edit_last()
         elif name in ("/like", "/dislike"):
             self._rate(1 if name == "/like" else -1)
         elif name == "/export":
@@ -2102,8 +2128,10 @@ class App:
             ("/compact", "сжать старые сообщения в сводку"),
             ("/persona", "показать карточку; /persona edit — править"),
             ("/new [название]", "новая сессия"),
-            ("/sessions", "список сессий"),
+            ("/sessions", "открытые сессии; /sessions all — с закрытыми"),
             ("/switch ID", "переключиться на сессию"),
+            ("/close [ID]", "закрыть сессию (история сохраняется)"),
+            ("/reopen ID", "снова открыть закрытую сессию"),
             ("/model имя", "сменить модель"),
             ("/temp X", "температура 0–2"),
             ("/export [md|jsonl]", "выгрузить диалог"),
@@ -2129,22 +2157,100 @@ class App:
             "r — заново, s — пропустить.[/]"
         )
 
-    def _sessions(self) -> None:
+    def _sessions(self, include_closed: bool = False) -> None:
+        rows = self.store.sessions(include_closed=include_closed)
+        if not rows:
+            self.console.print(
+                "[dim]открытых сессий нет. /new — создать.[/]"
+            )
+            return
         table = Table(border_style="magenta")
         table.add_column("ID", justify="right")
+        table.add_column("статус")
         table.add_column("начата")
         table.add_column("сообщений", justify="right")
         table.add_column("прогон", justify="right")
         table.add_column("название")
-        for row in self.store.sessions():
+        for row in rows:
             table.add_row(
                 str(row["id"]),
+                "закрыта" if row["ended_at"] else "открыта",
                 row["started_at"][:16].replace("T", " "),
                 str(row["n"]),
                 str(row["run_id"] or ""),
                 escape(row["title"] or ""),
             )
         self.console.print(table)
+        if include_closed:
+            self.console.print("[dim]/sessions — только открытые[/]")
+        else:
+            self.console.print(
+                "[dim]/sessions all — показать закрытые · "
+                "/close — закрыть текущую[/]"
+            )
+
+    def _closed_session_guard(self) -> bool:
+        if self.store.is_session_closed(self.session_id):
+            self.console.print(
+                f"[yellow]Сессия {self.session_id} закрыта. "
+                f"/reopen {self.session_id} — открыть.[/]"
+            )
+            return True
+        return False
+
+    def _close_session(self, raw: str) -> None:
+        session_id = parse_id(raw) if raw else self.session_id
+        if session_id is None:
+            self.console.print("[yellow]Нужен ID сессии. /close 12[/]")
+            return
+        if not self.store.get_session(session_id):
+            self.console.print("[yellow]Не нашёл такую сессию.[/]")
+            return
+        if self.store.is_session_closed(session_id):
+            self.console.print("[yellow]Сессия уже закрыта.[/]")
+            return
+        if self.active_run and self.active_run.session_id == session_id:
+            self.console.print(
+                f"[yellow]В сессии идёт прогон #{self.active_run.id}. "
+                f"Сначала /finish или /abandon.[/]"
+            )
+            return
+
+        open_count = len(self.store.sessions(include_closed=False))
+        self.store.close_session(session_id)
+        self.console.print(f"[green]✓ сессия {session_id} закрыта[/]")
+
+        if session_id != self.session_id:
+            return
+        if open_count <= 1:
+            self.session_id = self.store.create_session("новая сессия")
+            self.active_run = None
+            self.console.print(
+                f"[green]✓ это была последняя открытая; создана "
+                f"{self.session_id}[/]"
+            )
+            return
+        next_id = self.store.latest_open_session()
+        if next_id is None:
+            next_id = self.store.create_session("новая сессия")
+        self.session_id = next_id
+        self.active_run = self.store.active_run_for_session(self.session_id)
+        self.console.print(f"[green]✓ переключился на {self.session_id}[/]")
+
+    def _reopen_session(self, raw: str) -> None:
+        session_id = parse_id(raw) if raw else self.session_id
+        if session_id is None:
+            self.console.print("[yellow]Нужен ID сессии. /reopen 12[/]")
+            return
+        if not self.store.get_session(session_id):
+            self.console.print("[yellow]Не нашёл такую сессию.[/]")
+            return
+        if self.store.reopen_session(session_id):
+            self.session_id = session_id
+            self.active_run = self.store.active_run_for_session(session_id)
+            self.console.print(f"[green]✓ сессия {session_id} открыта[/]")
+        else:
+            self.console.print("[yellow]Сессия уже открыта.[/]")
 
     def _switch(self, raw: str) -> None:
         if not raw.isdigit() or not self.store.get_session(int(raw)):
