@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shlex
 import sys
 from typing import Any
@@ -27,7 +28,13 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from .cli import build_key_bindings, expand_alias, parse_id, persona_name
+from .cli import (
+    OPENING_INSTRUCTION,
+    build_key_bindings,
+    expand_alias,
+    parse_id,
+    persona_name,
+)
 from .config import Config
 from .llm import BaseLLM, LLMError, make_llm, strip_thinking
 from .prompt import (
@@ -40,7 +47,7 @@ from .prompt import (
     short_variant_instruction,
     summarization_messages,
 )
-from .store import Store
+from .store import Run, Store
 
 
 STYLE = Style.from_dict(
@@ -81,8 +88,18 @@ class TuiApp:
         self.temperature = cfg.llm.temperature
         self.variants = max(0, cfg.chat.variants)
         self.case_variants = max(2, cfg.case.variants)
+        self.variant_mode = cfg.chat.variant_mode.lower()
+        if self.variant_mode not in ("short", "full"):
+            self.variant_mode = "short"
+        self.seed_base = 0
 
         self.session_id = self._pick_session(session_id)
+        self.active_run: Run | None = self.store.active_run_for_session(
+            self.session_id
+        )
+        self.ask_kind: str | None = None
+        self.ask_prompt = ""
+        self.ask_data: dict[str, Any] = {}
         self.sessions: list[dict[str, Any]] = []
         self.sel_index = 0
         self.busy = False
@@ -104,6 +121,7 @@ class TuiApp:
         self.modal_filter = ""
         self.modal_sel = 0
         self.modal_hint = ""
+        self.modal_on_escape: Any = None
         self.modal_control = FormattedTextControl(
             self._modal_text, focusable=True
         )
@@ -235,6 +253,10 @@ class TuiApp:
             ("class:status", f" {self.llm.cfg.model} · {self.mode} · "),
             ("class:status", f"сессия {self.session_id} · "),
         ]
+        if self.active_run:
+            parts.append(
+                ("class:status", f"кейс #{self.active_run.case_id} · ")
+            )
         style = "class:error" if self.stage == "error" else "class:status"
         parts.append((style, state))
         if self.stage == "error" and self.error:
@@ -326,7 +348,11 @@ class TuiApp:
 
     # ── сообщения для модели ──────────────────────────────────────────────
 
-    def _messages(self, session_id: int | None = None) -> list[dict[str, str]]:
+    def _messages(
+        self,
+        session_id: int | None = None,
+        scenario: dict[str, Any] | None = None,
+    ) -> list[dict[str, str]]:
         session_id = self.session_id if session_id is None else session_id
         summary = self.store.latest_summary(session_id)
         after = summary.upto_message_id if summary else 0
@@ -345,7 +371,7 @@ class TuiApp:
             history=history,
             max_chars=self.cfg.chat.max_context_chars,
             language=self.cfg.chat.language,
-            scenario=None,
+            scenario=scenario,
             adult=self.adult,
             mode=self.mode,
         )
@@ -355,6 +381,9 @@ class TuiApp:
     def _submit(self, text: str) -> None:
         self.hint = ""
         text = text.strip()
+        if self.ask_kind is not None:
+            self._answer_ask(text)
+            return
         if not text:
             return
         if text.startswith("/") or text.startswith("\\"):
@@ -373,10 +402,14 @@ class TuiApp:
             self.invalidate()
             return
         session_id = self.session_id
-        self.store.add_message(session_id, "user", text)
+        user_message = self.store.add_message(session_id, "user", text)
         self._refresh_sessions()
         self._render_transcript()
-        if self.variants > 0:
+        if self.active_run:
+            self.app.create_background_task(
+                self._case_reply("case_turn", user_message.id)
+            )
+        elif self.variants > 0:
             self.app.create_background_task(
                 self._generate_variants(session_id)
             )
@@ -400,10 +433,12 @@ class TuiApp:
         title: str,
         items: list[tuple[Any, ...]],
         hint: str = "↑/↓ — выбор · Enter — выбрать · Esc — назад",
+        on_escape: Any = None,
     ) -> None:
         self.modal_title = title
         self.modal_items = items
         self.modal_hint = hint
+        self.modal_on_escape = on_escape
         self.modal_filter = ""
         self.modal_sel = 0
         self.modal_open = True
@@ -412,10 +447,14 @@ class TuiApp:
         self.invalidate()
 
     def _close_modal(self) -> None:
+        callback = self.modal_on_escape
+        self.modal_on_escape = None
         self.modal_open = False
         self.modal_items = []
         self.modal_filter = ""
         self._focus_input()
+        if callable(callback):
+            callback()
         self.invalidate()
 
     def _filtered_items(self) -> list[tuple[Any, ...]]:
@@ -490,6 +529,7 @@ class TuiApp:
         if not self._is_selectable(item):
             return
         action = item[1]
+        self.modal_on_escape = None
         self.modal_open = False
         self._focus_input()
         if callable(action):
@@ -538,6 +578,11 @@ class TuiApp:
             ("статистика", self._stats_hint),
             ("экспорт markdown", lambda: self._export("md")),
             ("экспорт jsonl", lambda: self._export("jsonl")),
+            ("кейсы (список)", self._cases_modal),
+            ("предложить кейс…", lambda: self._insert_input("/case suggest ")),
+            ("завершить кейс…", self._case_finish),
+            ("продолжить кейс", self._case_resume),
+            ("подсказка в кейсе", self._case_hint),
             ("помощь", self._open_help),
             ("выход", self.app.exit),
         ]
@@ -593,13 +638,21 @@ class TuiApp:
             ("----- модель -----", None, "header"),
             ("/load — загрузить модель в память", insert("/load")),
             ("/unload — выгрузить модель", insert("/unload")),
-            ("/loaded — что загружено", insert("/loaded")),
+            ("/loaded (/ps) — что загружено", insert("/loaded")),
             ("----- кейсы -----", None, "header"),
             ("/case текст — добавить кейс", insert("/case ")),
+            ("/case ID — начать прогон", insert("/case ")),
             ("/case suggest [идея] — модель предложит кейс", insert("/case suggest ")),
+            ("/case + ID — дополнить поля кейса", insert("/case + ")),
+            ("/case del ID — архивировать кейс", insert("/case del ")),
+            ("/case purge ID — удалить кейс навсегда", insert("/case purge ")),
+            ("/case export — выгрузить data/cases.md", insert("/case export")),
             ("/cases — список кейсов", insert("/cases")),
             ("/cases all — список с архивом", insert("/cases all")),
-            ("прогон и правка кейсов — в --no-tui", None),
+            ("/finish — завершить прогон: оценка и заметка", insert("/finish")),
+            ("/resume — продолжить незакрытый прогон", insert("/resume")),
+            ("/hint — 3 подсказки для твоей реплики", insert("/hint")),
+            ("/abandon — бросить прогон без оценки", insert("/abandon")),
         ]
 
     def _open_help(self) -> None:
@@ -634,10 +687,13 @@ class TuiApp:
         self.cfg.chat.mode = self.mode
         self._flash(f"режим: {self.mode}")
 
-    def _new_session(self) -> None:
+    def _new_session(self, title: str | None = None) -> None:
         if self._busy_guard():
             return
-        self.session_id = self.store.create_session()
+        if self.active_run:
+            self.store.abandon_run(self.active_run.id)
+            self.active_run = None
+        self.session_id = self.store.create_session(title)
         self._refresh_sessions()
         self._render_transcript()
 
@@ -801,7 +857,7 @@ class TuiApp:
         self,
         messages: list[dict[str, str]],
         session_id: int | None = None,
-    ) -> None:
+    ) -> str:
         session_id = self.session_id if session_id is None else session_id
         self.busy = True
         self.streaming = ""
@@ -857,7 +913,7 @@ class TuiApp:
             if self.session_id == session_id:
                 self._render_transcript()
             self.invalidate()
-            return
+            return ""
 
         reply = strip_thinking(self.streaming).strip()
         self.streaming_active = False
@@ -870,6 +926,7 @@ class TuiApp:
         if self.session_id == session_id:
             self._render_transcript()
         self.invalidate()
+        return reply
 
     def _on_progress(self, event: dict[str, Any]) -> None:
         if event.get("stage"):
@@ -894,6 +951,16 @@ class TuiApp:
             return
         self._render_transcript()
         self.invalidate()
+        if self.active_run:
+            kind = (
+                "case_opening"
+                if last.content == OPENING_INSTRUCTION
+                else "case_retry"
+            )
+            self.app.create_background_task(
+                self._case_reply(kind, last.id)
+            )
+            return
         session_id = self.session_id
         if self.variants > 0:
             self.app.create_background_task(
@@ -929,26 +996,54 @@ class TuiApp:
         arg = arg.strip()
         if not arg:
             self._flash(
-                "/case текст — добавить · /case suggest — предложить"
+                "/case текст — добавить · /case ID — играть · "
+                "/case suggest — предложить"
             )
             return
         if arg.isdigit():
-            self._flash("прогон кейса пока в --no-tui")
+            self._case_start(arg)
             return
         action, _, rest = arg.partition(" ")
         action_lower = action.lower()
         if action_lower in ("suggest", "предложи", "придумай", "идея", "gen"):
             self._case_suggest(rest.strip())
             return
-        if action_lower in ("del", "delete", "purge", "+", "edit", "правка"):
-            self._flash("управление кейсами — в --no-tui")
+        if action_lower in ("play", "играть", "сыграть"):
+            self._case_start(rest.strip())
+            return
+        if action_lower in ("+", "edit", "редактировать", "правка"):
+            self._case_edit(rest.strip())
+            return
+        if action_lower in ("finish", "завершить", "конец"):
+            self._case_finish()
+            return
+        if action_lower in ("resume", "продолжить", "дальше"):
+            self._case_resume()
+            return
+        if action_lower in ("hint", "подсказка"):
+            self._case_hint()
+            return
+        if action_lower in ("del", "delete", "удалить"):
+            self._case_delete(rest.strip())
+            return
+        if action_lower in ("purge", "hard-delete", "удалитьнавсегда"):
+            self._case_purge(rest.strip())
+            return
+        if action_lower in ("done", "готово", "закрыт"):
+            self._case_status(rest.strip(), "done")
+            return
+        if action_lower in ("export", "экспорт"):
+            self._case_export()
+            return
+        if action_lower in ("list", "список"):
+            self._cases_modal()
             return
         try:
             case = self.store.add_case(arg)
         except ValueError as exc:
             self._flash(str(exc)[:100])
             return
-        self._flash(f"кейс #{case.id} добавлен; дополнить — в --no-tui")
+        self._flash(f"кейс #{case.id} добавлен; /case + {case.id} — дополнить")
 
     def _case_suggest(self, seed: str) -> None:
         if self._busy_guard():
@@ -1041,6 +1136,698 @@ class TuiApp:
             items,
             hint="↑/↓ — выбор · Enter — действие · Esc — назад",
         )
+
+    # ── кейсы: прогоны и завершение ───────────────────────────────────────
+
+    def _case_scenario(self) -> dict[str, Any] | None:
+        if not self.active_run:
+            return None
+        return self.active_run.scenario
+
+    def _case_start(self, raw: str) -> None:
+        case_id = parse_id(raw)
+        if case_id is None:
+            self._flash("/case ID — начать прогон")
+            return
+        if self._busy_guard():
+            return
+        pending = self.active_run or self.store.latest_active_run()
+        if pending:
+            self.active_run = pending
+            self._flash(
+                f"уже идёт прогон #{pending.id}; /resume или /finish"
+            )
+            return
+        case = self.store.get_case(case_id)
+        if not case:
+            self._flash("не нашёл такой кейс")
+            return
+        session_id = self.store.create_session(
+            f"кейс #{case.id}: {case.situation[:50]}"
+        )
+        run = self.store.start_run(case, session_id)
+        self.session_id = session_id
+        self.active_run = run
+        self._refresh_sessions()
+        self._render_transcript()
+        self._flash(f"кейс #{case.id}: {case.situation[:50]}")
+        if case.opener == "me":
+            self._flash(f"кейс #{case.id}: начинай ты")
+            return
+        hidden = self.store.add_message(
+            session_id,
+            "user",
+            OPENING_INSTRUCTION,
+            meta={"hidden": True, "kind": "opening"},
+        )
+        self.app.create_background_task(
+            self._case_reply("case_opening", hidden.id)
+        )
+
+    async def _case_reply(
+        self, kind: str, cleanup_on_skip: int | None
+    ) -> None:
+        if self.variant_mode == "short":
+            await self._case_short_reply(kind, cleanup_on_skip)
+        else:
+            await self._case_full_reply(kind, cleanup_on_skip)
+
+    def _cleanup_skip(self, cleanup_on_skip: int | None, message: str) -> None:
+        if cleanup_on_skip:
+            self.store.delete_message(cleanup_on_skip)
+            self._render_transcript()
+        self._flash(message)
+
+    async def _case_short_reply(
+        self, kind: str, cleanup_on_skip: int | None
+    ) -> None:
+        beats = await self._generate_short_candidates_async(self.case_variants)
+        if not beats:
+            self._cleanup_skip(cleanup_on_skip, "модель не дала заготовок")
+            return
+        self._show_case_beats(beats, kind, cleanup_on_skip)
+
+    def _show_case_beats(
+        self,
+        beats: list[str],
+        kind: str,
+        cleanup_on_skip: int | None,
+    ) -> None:
+        items: list[tuple[Any, ...]] = []
+        for index, beat in enumerate(beats):
+            items.append(
+                (
+                    f"{index + 1}. {beat}",
+                    lambda beat=beat: self.app.create_background_task(
+                        self._case_expand(beat, beats, kind, cleanup_on_skip)
+                    ),
+                )
+            )
+        items.append(("----- действия -----", None, "header"))
+        items.append(
+            (
+                "заново",
+                lambda: self.app.create_background_task(
+                    self._case_reply(kind, cleanup_on_skip)
+                ),
+            )
+        )
+        items.append(
+            (
+                "пропустить",
+                lambda: self._cleanup_skip(cleanup_on_skip, "ход пропущен"),
+            )
+        )
+        self._open_modal(
+            "выберите реплику",
+            items,
+            hint="↑/↓ — выбор · Enter — развернуть · Esc — пропустить",
+            on_escape=lambda: self._cleanup_skip(
+                cleanup_on_skip, "ход пропущен"
+            ),
+        )
+
+    async def _case_expand(
+        self,
+        beat: str,
+        beats: list[str],
+        kind: str,
+        cleanup_on_skip: int | None,
+    ) -> None:
+        context = self._context_for_log()
+        messages = self._with_instruction(
+            self._messages(scenario=self._case_scenario()),
+            expand_instruction(beat, mode=self.mode),
+        )
+        reply = await self._stream_and_save(messages)
+        if not reply:
+            self._show_case_beats(beats, kind, cleanup_on_skip)
+            return
+        self._log_choice(
+            kind,
+            final=reply,
+            context=context,
+            beats=beats,
+            chosen_short=beats.index(beat),
+        )
+
+    async def _case_full_reply(
+        self, kind: str, cleanup_on_skip: int | None
+    ) -> None:
+        candidates = await self._generate_candidates_async(self.case_variants)
+        if not candidates:
+            self._cleanup_skip(cleanup_on_skip, "модель не дала вариантов")
+            return
+        self._show_case_candidates(candidates, kind, cleanup_on_skip)
+
+    def _show_case_candidates(
+        self,
+        candidates: list[tuple[str, float, Any]],
+        kind: str,
+        cleanup_on_skip: int | None,
+    ) -> None:
+        items: list[tuple[Any, ...]] = []
+        for index, (text, _temp, _stats) in enumerate(candidates):
+            items.append(
+                (
+                    f"{index + 1}. {' '.join(text.split())[:60]}",
+                    lambda text=text, index=index: self.app.create_background_task(
+                        self._case_save_candidate(
+                            text, candidates, index, kind, cleanup_on_skip
+                        )
+                    ),
+                )
+            )
+        items.append(("----- действия -----", None, "header"))
+        items.append(
+            (
+                "заново",
+                lambda: self.app.create_background_task(
+                    self._case_reply(kind, cleanup_on_skip)
+                ),
+            )
+        )
+        items.append(
+            (
+                "пропустить",
+                lambda: self._cleanup_skip(cleanup_on_skip, "ход пропущен"),
+            )
+        )
+        self._open_modal(
+            "выберите вариант",
+            items,
+            hint="↑/↓ — выбор · Enter — сохранить · Esc — пропустить",
+            on_escape=lambda: self._cleanup_skip(
+                cleanup_on_skip, "ход пропущен"
+            ),
+        )
+
+    async def _case_save_candidate(
+        self,
+        text: str,
+        candidates: list[tuple[str, float, Any]],
+        index: int,
+        kind: str,
+        cleanup_on_skip: int | None,
+    ) -> None:
+        context = self._context_for_log()
+        self.store.add_message(self.session_id, "assistant", text)
+        self._refresh_sessions()
+        self._render_transcript()
+        self._log_choice(
+            kind,
+            final=text,
+            context=context,
+            candidates=candidates,
+            chosen=index,
+        )
+
+    def _context_for_log(self) -> list[dict[str, str]]:
+        return [
+            message
+            for message in self._messages(scenario=self._case_scenario())
+            if message["content"] != OPENING_INSTRUCTION
+        ]
+
+    def _log_choice(
+        self,
+        kind: str,
+        final: str,
+        context: list[dict[str, str]],
+        beats: list[str] | None = None,
+        chosen_short: int | None = None,
+        candidates: list[tuple[str, float, Any]] | None = None,
+        chosen: int | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "type": "choice",
+            "kind": kind,
+            "session_id": self.session_id,
+            "model": self.llm.cfg.model,
+            "context": context,
+            "final": final,
+        }
+        if self.active_run:
+            record["case_id"] = self.active_run.case_id
+            record["run_id"] = self.active_run.id
+        if beats is not None:
+            record["short_candidates"] = beats
+            record["chosen_short"] = chosen_short
+        if candidates is not None:
+            record["candidates"] = [
+                {"text": text, "temperature": temperature}
+                for text, temperature, _stats in candidates
+            ]
+            record["chosen"] = chosen
+        self._log(record)
+
+    async def _generate_short_candidates_async(
+        self, count: int
+    ) -> list[str]:
+        count = max(1, count)
+        temps = self.cfg.chat.variant_temperatures or [self.temperature]
+        base = self.seed_base
+        self.seed_base += count
+        loop = asyncio.get_running_loop()
+        self.llm.on_progress = lambda event: loop.call_soon_threadsafe(
+            self._on_progress, event
+        )
+        self.busy = True
+        self.stage = "generation"
+        self.tps = 0.0
+        self.tokens = 0
+        self.invalidate()
+        beats: list[str] = []
+        error: str | None = None
+        try:
+            for index in range(count):
+                messages = self._with_instruction(
+                    self._messages(scenario=self._case_scenario()),
+                    short_variant_instruction(),
+                )
+                raw = await asyncio.to_thread(
+                    self.llm.complete,
+                    messages,
+                    temperature=temps[index % len(temps)],
+                    max_tokens=self.cfg.chat.short_max_tokens,
+                    seed=base + index,
+                )
+                parsed = parse_short_variants(raw, 1)
+                if parsed:
+                    beats.append(parsed[0])
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        finally:
+            self.llm.on_progress = None
+            self.busy = False
+            self.stage = "ready" if error is None else "error"
+            if error is not None:
+                self.error = error
+            self.invalidate()
+        if error is not None:
+            self._flash(f"ошибка генерации: {error[:80]}")
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for beat in beats:
+            key = beat.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(beat)
+        return result[:count]
+
+    async def _generate_candidates_async(
+        self, count: int
+    ) -> list[tuple[str, float, Any]]:
+        count = max(1, count)
+        temps = self.cfg.case.temperatures or [self.temperature]
+        base = self.seed_base
+        self.seed_base += count
+        loop = asyncio.get_running_loop()
+        self.llm.on_progress = lambda event: loop.call_soon_threadsafe(
+            self._on_progress, event
+        )
+        self.busy = True
+        self.stage = "generation"
+        self.tps = 0.0
+        self.tokens = 0
+        self.invalidate()
+        candidates: list[tuple[str, float, Any]] = []
+        error: str | None = None
+        try:
+            for index in range(count):
+                text = await asyncio.to_thread(
+                    self.llm.complete,
+                    self._messages(scenario=self._case_scenario()),
+                    temperature=temps[index % len(temps)],
+                    seed=base + index,
+                )
+                if text:
+                    candidates.append(
+                        (text, temps[index % len(temps)], self.llm.last_stats)
+                    )
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        finally:
+            self.llm.on_progress = None
+            self.busy = False
+            self.stage = "ready" if error is None else "error"
+            if error is not None:
+                self.error = error
+            self.invalidate()
+        if error is not None:
+            self._flash(f"ошибка генерации: {error[:80]}")
+            return []
+        return candidates
+
+    # ── завершение / возобновление / подсказка / правка ──────────────────
+
+    def _case_finish(self) -> None:
+        if not self.active_run:
+            self._flash("нет активного прогона")
+            return
+        self.ask_data = {}
+        self._ask("rating", "оценка 1–5 (Enter — 3)")
+
+    def _finish_run(self, rating: int, notes: str | None) -> None:
+        run = self.active_run
+        if not run:
+            self._flash("нет активного прогона")
+            return
+        self.store.finish_run(run.id, rating, notes)
+        turns = self.store.count_turns(run.session_id)
+        replies = len(
+            self.store.messages(
+                run.session_id, roles=("user", "assistant"), include_hidden=False
+            )
+        )
+        self._log(
+            {
+                "type": "run_finish",
+                "run_id": run.id,
+                "case_id": run.case_id,
+                "session_id": run.session_id,
+                "rating": rating,
+                "notes": notes,
+                "turns": turns,
+                "replies": replies,
+            }
+        )
+        if self.cfg.case.auto_export:
+            self._export_run(run.id)
+        self.active_run = None
+        self.session_id = self.store.create_session(
+            f"после кейса #{run.case_id}"
+        )
+        self._refresh_sessions()
+        self._render_transcript()
+        self._flash(f"прогон #{run.id} закрыт · {rating}/5")
+
+    def _export_run(self, run_id: int) -> None:
+        run = self.store.get_run(run_id)
+        if not run:
+            return
+        messages = self.store.messages(
+            run.session_id, roles=("user", "assistant"), include_hidden=False
+        )
+        data = {
+            "run_id": run.id,
+            "case_id": run.case_id,
+            "case": run.scenario,
+            "status": run.status,
+            "rating": run.rating,
+            "notes": run.notes,
+            "created_at": run.created_at,
+            "finished_at": run.finished_at,
+            "messages": [
+                {
+                    "role": message.role,
+                    "content": message.content,
+                    "created_at": message.created_at,
+                }
+                for message in messages
+            ],
+        }
+        directory = self.cfg.path("data/runs")
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"run_{run.id}.json"
+        path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _case_resume(self) -> None:
+        if self._busy_guard():
+            return
+        run = self.active_run or self.store.latest_active_run()
+        if not run:
+            self._flash("незакрытых прогонов нет")
+            return
+        self.session_id = run.session_id
+        self.active_run = run
+        self._refresh_sessions()
+        self._render_transcript()
+        self._flash(f"прогон #{run.id} · кейс #{run.case_id}")
+
+    def _case_hint(self) -> None:
+        if not self.active_run:
+            self._flash("подсказка работает только в прогоне")
+            return
+        if self._busy_guard():
+            return
+        self.app.create_background_task(self._case_hint_async())
+
+    async def _case_hint_async(self) -> None:
+        scenario_data = self.active_run.scenario
+        messages = self.store.messages(
+            self.session_id, roles=("user", "assistant"), include_hidden=False
+        )
+        transcript = "\n".join(
+            f"{'Он' if message.role == 'user' else 'Она'}: {message.content}"
+            for message in messages[-12:]
+        )
+        scenario_lines = []
+        if scenario_data.get("situation"):
+            scenario_lines.append(f"Ситуация: {scenario_data['situation']}")
+        if scenario_data.get("tone"):
+            scenario_lines.append(f"Тон: {scenario_data['tone']}")
+        if scenario_data.get("her_goal"):
+            scenario_lines.append(f"Её цель: {scenario_data['her_goal']}")
+        scenario = "\n".join(scenario_lines) + ("\n" if scenario_lines else "")
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты помогаешь придумать реплику в ролевой сцене. "
+                    "Верни ровно три коротких варианта того, что мог бы "
+                    "сказать он. Каждый вариант — с новой строки, без "
+                    "нумерации, без кавычек. Пиши по-русски, живо."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"{scenario}\nДиалог:\n{transcript}\n\n"
+                "Что мог бы сказать он?",
+            },
+        ]
+        self.busy = True
+        self.stage = "generation"
+        self.invalidate()
+        loop = asyncio.get_running_loop()
+        self.llm.on_progress = lambda event: loop.call_soon_threadsafe(
+            self._on_progress, event
+        )
+        try:
+            raw = await asyncio.to_thread(
+                self.llm.complete, prompt, temperature=0.9, max_tokens=300
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.busy = False
+            self.stage = "error"
+            self.error = str(exc)
+            self.invalidate()
+            return
+        finally:
+            self.llm.on_progress = None
+        self.busy = False
+        self.stage = "ready"
+        self.invalidate()
+        lines = self._parse_hints(raw)
+        if not lines:
+            self._flash("не удалось разобрать подсказки")
+            return
+        self._open_modal(
+            "подсказки",
+            [(line, None) for line in lines],
+            hint="↑/↓ — просмотр · Esc — назад",
+        )
+
+    @staticmethod
+    def _parse_hints(raw: str) -> list[str]:
+        lines: list[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            line = re.sub(r"^[\d]+[\.\)]\s*", "", line)
+            line = re.sub(r"^[-•*]\s*", "", line)
+            line = line.strip(" «»\"'")
+            if line:
+                lines.append(line)
+        return lines[:3]
+
+    def _abandon(self) -> None:
+        if not self.active_run:
+            self._flash("нет активного прогона")
+            return
+        self.store.abandon_run(self.active_run.id)
+        self._flash(f"прогон #{self.active_run.id} брошен")
+        self.active_run = None
+
+    def _case_edit(self, raw: str) -> None:
+        case_id = parse_id(raw)
+        if case_id is None:
+            self._flash("/case + ID — дополнить поля")
+            return
+        case = self.store.get_case(case_id)
+        if not case:
+            self._flash("не нашёл такой кейс")
+            return
+        fields = [
+            ("situation", "ситуация"),
+            ("relationship", "отношения"),
+            ("her_goal", "её цель"),
+            ("tone", "тон"),
+            ("restrictions", "нельзя"),
+            ("opener", "кто начинает (her/me)"),
+            ("tags", "теги"),
+        ]
+        self.ask_data = {
+            "case_id": case_id,
+            "fields": fields,
+            "index": 0,
+            "updates": {},
+            "case": case,
+        }
+        self._ask_case_edit_field()
+
+    def _ask_case_edit_field(self) -> None:
+        data = self.ask_data
+        index = data["index"]
+        if index >= len(data["fields"]):
+            self._finish_case_edit()
+            return
+        key, label = data["fields"][index]
+        current = getattr(data["case"], key) or ""
+        self._ask("case_edit", f"{label} [{current}] › пустой ввод — оставить")
+
+    def _case_edit_next(self, text: str) -> None:
+        data = self.ask_data
+        index = data["index"]
+        key, _label = data["fields"][index]
+        if text.strip():
+            data["updates"][key] = text.strip()
+        data["index"] = index + 1
+        self._ask_case_edit_field()
+
+    def _finish_case_edit(self) -> None:
+        data = self.ask_data
+        updates = data["updates"]
+        case_id = data["case_id"]
+        self.ask_data = {}
+        if updates:
+            self.store.update_case(case_id, **updates)
+            self._flash(f"кейс #{case_id} обновлён")
+        else:
+            self._flash("без изменений")
+
+    def _case_delete(self, raw: str) -> None:
+        case_id = parse_id(raw)
+        if case_id is None:
+            self._flash("/case del ID")
+            return
+        if self.active_run and self.active_run.case_id == case_id:
+            self._flash("этот кейс сейчас играется; /finish сначала")
+            return
+        case = self.store.get_case(case_id)
+        if not case:
+            self._flash("не нашёл такой кейс")
+            return
+        if case.status == "archived":
+            self._flash("кейс уже в архиве")
+            return
+        if self.store.archive_case(case_id):
+            self._flash(f"кейс #{case_id} архивирован")
+
+    def _case_purge(self, raw: str) -> None:
+        case_id = parse_id(raw)
+        if case_id is None:
+            self._flash("/case purge ID")
+            return
+        if self.active_run and self.active_run.case_id == case_id:
+            self._flash("этот кейс сейчас играется; /finish сначала")
+            return
+        if not self.store.get_case(case_id):
+            self._flash("не нашёл такой кейс")
+            return
+        self.ask_data = {"case_id": case_id}
+        self._ask("confirm_purge", f"удалить кейс #{case_id} навсегда? [y/N]")
+
+    def _case_status(self, raw: str, status: str) -> None:
+        case_id = parse_id(raw)
+        if case_id is None:
+            self._flash("/case done ID")
+            return
+        if self.store.set_case_status(case_id, status):
+            self._flash(f"кейс #{case_id}: {status}")
+        else:
+            self._flash("не нашёл такой кейс")
+
+    def _case_export(self) -> None:
+        cases = self.store.cases(include_archived=True)
+        path = self.cfg.path("data/cases.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# Кейсы", "", f"Всего: {len(cases)}", ""]
+        for case in cases:
+            stats = self.store.run_stats(case.id)
+            lines.append(f"## #{case.id} — {case.situation}")
+            for label, value in (
+                ("Отношения", case.relationship),
+                ("Её цель", case.her_goal),
+                ("Тон", case.tone),
+                ("Нельзя", case.restrictions),
+                ("Теги", case.tags),
+            ):
+                if value:
+                    lines.append(f"- **{label}:** {value}")
+            lines.append(
+                f"- **Прогоны:** {stats['total']} · "
+                f"**Лучшая:** {stats['best'] or '—'}"
+            )
+            lines.append("")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self._flash(f"экспорт: {path}")
+
+    # ── ввод с вопросом (оценка, заметка, подтверждение, правка) ──────────
+
+    def _ask(self, kind: str, prompt: str) -> None:
+        self.ask_kind = kind
+        self.ask_prompt = prompt
+        self.input_area.buffer.reset()
+        self._flash(prompt)
+        self.app.layout.focus(self.input_area)
+
+    def _cancel_ask(self) -> None:
+        self.ask_kind = None
+        self.ask_prompt = ""
+        self.ask_data = {}
+        self._flash("отменено")
+
+    def _answer_ask(self, text: str) -> None:
+        kind = self.ask_kind
+        self.ask_kind = None
+        self.ask_prompt = ""
+        if kind == "rating":
+            rating = 3
+            if text.isdigit() and 1 <= int(text) <= 5:
+                rating = int(text)
+            self.ask_data["rating"] = rating
+            self._ask("notes", "заметка (Enter — без заметки)")
+        elif kind == "notes":
+            rating = self.ask_data.get("rating", 3)
+            notes = text.strip() or None
+            self.ask_data = {}
+            self._finish_run(rating, notes)
+        elif kind == "confirm_purge":
+            case_id = self.ask_data.get("case_id")
+            self.ask_data = {}
+            if text.strip().lower() in ("y", "yes", "д", "да"):
+                if self.store.purge_case(case_id):
+                    self._flash(f"кейс #{case_id} удалён навсегда")
+                else:
+                    self._flash("не нашёл такой кейс")
+            else:
+                self._flash("отменено")
+        elif kind == "case_edit":
+            self._case_edit_next(text)
 
     def _begin_edit_last(self) -> None:
         message = self.store.last_message(self.session_id, "assistant")
@@ -1196,12 +1983,8 @@ class TuiApp:
             self.app.exit()
             return
         if name in ("/new", "\\т"):
-            if self._busy_guard():
-                return
             title = text.split(" ", 1)[1] if " " in text else None
-            self.session_id = self.store.create_session(title)
-            self._refresh_sessions()
-            self._render_transcript()
+            self._new_session(title)
             self.invalidate()
             return
         if name in ("/sessions", "/session", "\\ы"):
@@ -1291,7 +2074,7 @@ class TuiApp:
             self._load_model()
         elif name == "/unload":
             self._unload_model()
-        elif name == "/loaded":
+        elif name in ("/loaded", "/ps"):
             self._loaded_hint()
         elif name == "/export":
             self._export(arg or "md")
@@ -1312,8 +2095,16 @@ class TuiApp:
             self._case_command(arg)
         elif name == "/case_suggest":
             self._case_suggest(arg)
-        elif name in ("/case_edit", "/finish", "/resume", "/hint", "/abandon"):
-            self._flash("кейсы и прогоны пока в --no-tui")
+        elif name == "/case_edit":
+            self._case_edit(arg)
+        elif name == "/finish":
+            self._case_finish()
+        elif name == "/resume":
+            self._case_resume()
+        elif name == "/hint":
+            self._case_hint()
+        elif name == "/abandon":
+            self._abandon()
         else:
             self._flash(f"не знаю команду {name}")
 
@@ -1359,9 +2150,7 @@ class TuiApp:
         def _(event) -> None:
             if self._busy_guard():
                 return
-            self.session_id = self.store.create_session()
-            self._refresh_sessions()
-            self._render_transcript()
+            self._new_session()
             event.app.layout.focus(self.input_area)
             self.invalidate()
 
@@ -1425,6 +2214,14 @@ class TuiApp:
         )
         def _cancel_edit(event) -> None:
             self._cancel_edit()
+
+        @kb.add(
+            "escape",
+            filter=Condition(lambda: self.ask_kind is not None),
+            eager=True,
+        )
+        def _cancel_ask(event) -> None:
+            self._cancel_ask()
 
         return kb
 
