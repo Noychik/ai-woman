@@ -554,10 +554,19 @@ class TuiApp:
         self._open_modal("помощь (Esc — закрыть)", self._help_items())
 
     def _model_menu(self) -> None:
-        models = self.llm.list_models()
+        self.app.create_background_task(self._model_menu_async())
+
+    async def _model_menu_async(self) -> None:
+        try:
+            models = await asyncio.to_thread(self.llm.list_models)
+        except LLMError as exc:
+            self._flash(str(exc)[:80])
+            return
         if not models:
             models = [self.llm.cfg.model]
-        items = [(name, lambda name=name: self._set_model(name)) for name in models]
+        items = [
+            (name, lambda name=name: self._set_model(name)) for name in models
+        ]
         self._open_modal("модели", items)
 
     def _set_model(self, name: str) -> None:
@@ -577,18 +586,43 @@ class TuiApp:
         self._render_transcript()
 
     def _load_model(self) -> None:
+        if self._busy_guard():
+            return
+        self.app.create_background_task(self._load_model_async())
+
+    async def _load_model_async(self) -> None:
         try:
-            self.llm.load_model()
+            await asyncio.to_thread(self.llm.load_model)
             self._flash("модель загружена")
         except LLMError as exc:
             self._flash(str(exc)[:80])
 
     def _unload_model(self) -> None:
+        if self._busy_guard():
+            return
+        self.app.create_background_task(self._unload_model_async())
+
+    async def _unload_model_async(self) -> None:
         try:
-            self.llm.unload_model()
+            await asyncio.to_thread(self.llm.unload_model)
             self._flash("модель выгружена")
         except LLMError as exc:
             self._flash(str(exc)[:80])
+
+    def _loaded_hint(self) -> None:
+        self.app.create_background_task(self._loaded_hint_async())
+
+    async def _loaded_hint_async(self) -> None:
+        try:
+            loaded = await asyncio.to_thread(self.llm.loaded_models)
+        except LLMError as exc:
+            self._flash(str(exc)[:80])
+            return
+        if loaded:
+            total = sum(int(model.get("size") or 0) for model in loaded)
+            self._flash(f"в памяти: {len(loaded)} · {total / 1024**3:.1f} ГБ")
+        else:
+            self._flash("модель не загружена")
 
     def _stats_hint(self) -> None:
         runs = self.store.runs()
@@ -815,12 +849,14 @@ class TuiApp:
     def _edit_persona(self, path: Any) -> None:
         if self._busy_guard():
             return
+        self.app.create_background_task(self._edit_persona_async(path))
+
+    async def _edit_persona_async(self, path: Any) -> None:
         editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
         try:
-            self.app.run_system_command(
+            await self.app.run_system_command(
                 f"{editor} {shlex.quote(str(path))}",
-                wait_for_enter=True,
-                display_before_text="редактор персонажа",
+                wait_for_enter=False,
             )
         except Exception as exc:  # noqa: BLE001
             self._flash(f"не удалось открыть редактор: {exc}"[:100])
@@ -1096,22 +1132,11 @@ class TuiApp:
             else:
                 self._model_menu()
         elif name == "/load":
-            if not self._busy_guard():
-                self._load_model()
+            self._load_model()
         elif name == "/unload":
-            if not self._busy_guard():
-                self._unload_model()
+            self._unload_model()
         elif name == "/loaded":
-            loaded = self.llm.loaded_models()
-            if loaded:
-                total = sum(
-                    int(model.get("size") or 0) for model in loaded
-                )
-                self._flash(
-                    f"в памяти: {len(loaded)} · {total / 1024**3:.1f} ГБ"
-                )
-            else:
-                self._flash("модель не загружена")
+            self._loaded_hint()
         elif name == "/export":
             self._export(arg or "md")
         elif name == "/stats":
