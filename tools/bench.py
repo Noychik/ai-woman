@@ -132,7 +132,8 @@ def main() -> int:
             continue
 
         # Qwen3 8B abliterated — thinking-модель, остальным /no_think не нужен.
-        no_think = cfg.llm.no_think and "qwen3-abliterated:8b" in model
+        # Включаем принудительно, независимо от no_think в конфиге ветки.
+        no_think = "qwen3-abliterated:8b" in model
         model_cfg = replace(
             cfg.llm,
             model=model,
