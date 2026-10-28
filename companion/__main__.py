@@ -4,7 +4,6 @@ import argparse
 import sys
 from pathlib import Path
 
-from .cli import App
 from .config import load_config
 
 
@@ -30,6 +29,11 @@ def main() -> None:
         type=int,
         help="переопределить число вариантов (0 — обычный чат)",
     )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="не использовать полноэкранный интерфейс (старый линейный чат)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -42,7 +46,14 @@ def main() -> None:
         cfg.chat.variants = args.variants
 
     try:
-        App(cfg, session_id=args.session).run()
+        if sys.stdin.isatty() and not args.no_tui:
+            from .tui import run_tui
+
+            run_tui(cfg, session_id=args.session)
+        else:
+            from .cli import App
+
+            App(cfg, session_id=args.session).run()
     except KeyboardInterrupt:
         print()
     except EOFError:
