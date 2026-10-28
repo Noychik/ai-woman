@@ -551,10 +551,13 @@ class MockLLM(BaseLLM):
                 r"Выбранная заготовка её ответа: «(.+?)»", system
             )
             beat = match.group(1) if match else "ну и ладно"
-            text = (
-                f"*отводит взгляд* {beat}. "
-                "*садится обратно* я уже думала, ты не придёшь."
-            )
+            if "Без *действий*" in system:
+                text = f"{beat}. я уже думала, ты не придёшь :["
+            else:
+                text = (
+                    f"*отводит взгляд* {beat}. "
+                    "*садится обратно* я уже думала, ты не придёшь."
+                )
             self._mock_stats(text)
             tokens = max(1, len(text) // 4)
             self._emit_progress(

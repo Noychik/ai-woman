@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -14,6 +15,8 @@ from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.live import Live
@@ -224,6 +227,76 @@ def parse_id(raw: str) -> int | None:
     return int(raw) if raw.isdigit() else None
 
 
+def build_key_bindings() -> KeyBindings:
+    kb = KeyBindings()
+
+    @kb.add(Keys.ControlLeft)
+    def _word_left(event) -> None:
+        buff = event.current_buffer
+        offset = buff.document.find_previous_word_beginning(count=1)
+        if offset is not None:
+            buff.cursor_position += offset
+
+    @kb.add(Keys.ControlRight)
+    def _word_right(event) -> None:
+        buff = event.current_buffer
+        offset = buff.document.find_next_word_beginning(count=1)
+        if offset is not None:
+            buff.cursor_position += offset
+
+    @kb.add(Keys.ControlH)
+    def _delete_word_left(event) -> None:
+        buff = event.current_buffer
+        offset = buff.document.find_previous_word_beginning(count=1)
+        if offset is not None:
+            buff.delete_before_cursor(count=-offset)
+
+    @kb.add(Keys.ControlDelete)
+    def _delete_word_right(event) -> None:
+        buff = event.current_buffer
+        offset = buff.document.find_next_word_beginning(count=1)
+        if offset is not None:
+            buff.delete(count=offset)
+
+    @kb.add(Keys.Home)
+    def _home(event) -> None:
+        buff = event.current_buffer
+        buff.cursor_position += buff.document.get_start_of_line_position()
+
+    @kb.add(Keys.End)
+    def _end(event) -> None:
+        buff = event.current_buffer
+        buff.cursor_position += buff.document.get_end_of_line_position()
+
+    @kb.add(Keys.ControlHome)
+    def _buffer_home(event) -> None:
+        event.current_buffer.cursor_position = 0
+
+    @kb.add(Keys.ControlEnd)
+    def _buffer_end(event) -> None:
+        event.current_buffer.cursor_position = len(event.current_buffer.text)
+
+    return kb
+
+
+def wrap_words(text: str, width: int) -> str:
+    """Перенос по словам; длинные слова не разрезаются без необходимости."""
+    if width <= 10:
+        return text
+    lines: list[str] = []
+    for line in text.splitlines() or [""]:
+        wrapped = textwrap.wrap(
+            line,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=True,
+        )
+        lines.extend(wrapped or [""])
+    return "\n".join(lines)
+
+
 class GenerationProgress:
     """Живой статус: этап, токены и скорость прямо во время генерации."""
 
@@ -337,7 +410,9 @@ class GenerationProgress:
         text = Text()
         if self.show_answer:
             text.append(f"{self.title} › ", style="bold magenta")
-            text.append(self.answer)
+            text.append(
+                wrap_words(self.answer, max(20, self.console.width - 2))
+            )
             text.append("\n")
         elapsed = time.perf_counter() - self.started
         if self.stage in ("connecting", "load", "prompt"):
@@ -411,6 +486,9 @@ class App:
         self.variant_mode = cfg.chat.variant_mode.lower()
         if self.variant_mode not in ("short", "full"):
             self.variant_mode = "short"
+        self.mode = cfg.chat.mode.lower()
+        if self.mode not in ("roleplay", "messaging"):
+            self.mode = "roleplay"
         self.adult = cfg.content.adult
         self.temperature = cfg.llm.temperature
         self.seed_base = 0
@@ -440,7 +518,12 @@ class App:
         history_path = self.cfg.path("data/history.txt")
         history_path.parent.mkdir(parents=True, exist_ok=True)
         style = Style.from_dict({"prompt": "ansimagenta bold"})
-        return PromptSession(history=FileHistory(str(history_path)), style=style)
+        return PromptSession(
+            history=FileHistory(str(history_path)),
+            style=style,
+            key_bindings=build_key_bindings(),
+            wrap_lines=True,
+        )
 
     def ask(self, prompt: str) -> str:
         if self.session is not None:
@@ -655,6 +738,7 @@ class App:
             language=self.cfg.chat.language,
             scenario=scenario,
             adult=self.adult,
+            mode=self.mode,
         )
 
     def _context_for_log(self) -> list[dict[str, str]]:
@@ -855,7 +939,8 @@ class App:
 
     def _expand_beat(self, beat: str) -> str:
         messages = self._with_instruction(
-            self._messages_for_model(), expand_instruction(beat)
+            self._messages_for_model(),
+            expand_instruction(beat, mode=self.mode),
         )
         return self._stream_reply(messages, warn_empty=False)
 
@@ -1144,6 +1229,7 @@ class App:
             language=self.cfg.chat.language,
             scenario=scenario,
             adult=self.adult,
+            mode=self.mode,
         )
         return [
             message

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from companion.cli import expand_alias
+from companion.cli import build_key_bindings, expand_alias, wrap_words
 from companion.prompt import (
     build_messages,
     case_suggestion_messages,
@@ -190,6 +190,38 @@ class ScenarioPromptTests(unittest.TestCase):
         )
         self.assertNotIn("## Сцена", messages[0]["content"])
 
+    def test_messaging_prompt_has_no_actions(self) -> None:
+        messages = build_messages(
+            persona="Ты — Алиса.",
+            facts=[],
+            summary=None,
+            history=[make_message(1, "user", "привет")],
+            max_chars=5000,
+            mode="messaging",
+        )
+        system = messages[0]["content"]
+        self.assertIn("мессенджере", system)
+        self.assertIn("ASCII", system)
+        self.assertNotIn("Действия и мимику", system)
+
+    def test_roleplay_prompt_has_actions(self) -> None:
+        messages = build_messages(
+            persona="Ты — Алиса.",
+            facts=[],
+            summary=None,
+            history=[make_message(1, "user", "привет")],
+            max_chars=5000,
+            mode="roleplay",
+        )
+        self.assertIn("Действия и мимику", messages[0]["content"])
+
+    def test_messaging_expand_has_no_actions(self) -> None:
+        instruction = expand_instruction("ну ты и выбрал момент", mode="messaging")
+        self.assertIn("мессенджере", instruction)
+        self.assertNotIn("*улыбается*", instruction)
+        self.assertNotIn("*отводит", instruction)
+        self.assertIn("ASCII", instruction)
+
 
 class ShortVariantTests(unittest.TestCase):
     def test_parse_numbered(self) -> None:
@@ -290,6 +322,17 @@ class CaseSuggestionTests(unittest.TestCase):
             adult=False,
         )
         self.assertNotIn("Ты взрослая женщина", messages[0]["content"])
+
+
+class EditingTests(unittest.TestCase):
+    def test_key_bindings_build(self) -> None:
+        self.assertIsNotNone(build_key_bindings())
+
+    def test_wrap_words_does_not_split_long_word(self) -> None:
+        text = "короткое оченьдлинноесловобезпробелов конец"
+        wrapped = wrap_words(text, 12)
+        self.assertIn("оченьдлинноесловобезпробелов", wrapped)
+        self.assertIn("\n", wrapped)
 
 
 class AliasTests(unittest.TestCase):

@@ -36,6 +36,8 @@ class ChatConfig:
     max_context_chars: int = 18000
     summarize_after: int = 36
     variants: int = 0
+    # roleplay — сцены с *действиями*; messaging — переписка без действий.
+    mode: str = "roleplay"
     variant_mode: str = "short"
     short_max_tokens: int = 60
     variant_temperatures: list[float] = field(
