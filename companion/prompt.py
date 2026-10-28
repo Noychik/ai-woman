@@ -21,7 +21,6 @@ def scenario_block(scenario: dict[str, Any]) -> str:
     fields = [
         ("relationship", "Отношения"),
         ("her_goal", "Её цель"),
-        ("my_goal", "Его цель"),
         ("tone", "Тон"),
         ("restrictions", "Ограничения"),
     ]
@@ -194,7 +193,6 @@ def case_suggestion_messages(
         '  "situation": "1–2 предложения: что произошло и где",\n'
         '  "relationship": "кто вы друг другу и как давно",\n'
         '  "her_goal": "чего она хочет в этой сцене",\n'
-        '  "my_goal": "чего он хочет или чего избегает",\n'
         '  "tone": "тон сцены",\n'
         '  "restrictions": "чего не должно быть",\n'
         '  "opener": "her"\n'
@@ -252,7 +250,7 @@ def parse_case_card(raw: str) -> dict[str, str] | None:
         return None
 
     card: dict[str, str] = {"situation": situation[:500]}
-    for key in ("relationship", "her_goal", "my_goal", "tone", "restrictions"):
+    for key in ("relationship", "her_goal", "tone", "restrictions"):
         value = data.get(key)
         if value:
             cleaned = " ".join(str(value).split()).strip()

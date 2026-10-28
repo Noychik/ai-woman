@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +53,16 @@ class BaseLLM:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
         self.last_stats: GenerationStats | None = None
+        self.on_progress: Callable[[dict[str, Any]], None] | None = None
+
+    def _emit_progress(self, **data: Any) -> None:
+        if not self.on_progress:
+            return
+        try:
+            self.on_progress(data)
+        except Exception:  # noqa: BLE001
+            # Ошибка отрисовки не должна ломать генерацию.
+            pass
 
     def stream(
         self,
@@ -145,6 +155,9 @@ class OllamaLLM(BaseLLM):
         seed: int | None = None,
     ) -> Iterator[str]:
         self.last_stats = None
+        self._emit_progress(
+            stage="connecting", tokens=0, tokens_per_second=0.0
+        )
         if self.cfg.no_think and messages and messages[0].get("role") == "system":
             messages = [dict(message) for message in messages]
             messages[0]["content"] = (
@@ -174,6 +187,13 @@ class OllamaLLM(BaseLLM):
                         raise LLMError(
                             f"Ollama вернул {response.status_code}: {body[:600]}"
                         )
+                    self._emit_progress(
+                        stage="prompt", tokens=0, tokens_per_second=0.0
+                    )
+                    started = time.perf_counter()
+                    first_at: float | None = None
+                    tokens = 0
+                    last_emit = 0.0
                     for line in response.iter_lines():
                         if not line:
                             continue
@@ -186,9 +206,41 @@ class OllamaLLM(BaseLLM):
                         message = data.get("message") or {}
                         chunk = message.get("content") or ""
                         if chunk:
+                            now = time.perf_counter()
+                            if first_at is None:
+                                first_at = now
+                            tokens += 1
+                            if now - last_emit >= 0.2:
+                                elapsed = max(0.001, now - first_at)
+                                self._emit_progress(
+                                    stage="generation",
+                                    tokens=tokens,
+                                    elapsed=elapsed,
+                                    tokens_per_second=tokens / elapsed,
+                                )
+                                last_emit = now
                             yield chunk
                         if data.get("done"):
                             self.last_stats = self._stats_from_ollama(data)
+                            stats = self.last_stats
+                            if stats:
+                                self._emit_progress(
+                                    stage="done",
+                                    tokens=stats.tokens,
+                                    elapsed=stats.seconds,
+                                    tokens_per_second=stats.tokens_per_second,
+                                )
+                            else:
+                                elapsed = max(
+                                    0.001,
+                                    time.perf_counter() - (first_at or started),
+                                )
+                                self._emit_progress(
+                                    stage="done",
+                                    tokens=tokens,
+                                    elapsed=elapsed,
+                                    tokens_per_second=tokens / elapsed,
+                                )
                             break
         except httpx.ConnectError as exc:
             raise LLMError(
@@ -301,10 +353,14 @@ class OpenAILLM(BaseLLM):
         seed: int | None = None,
     ) -> Iterator[str]:
         self.last_stats = None
+        self._emit_progress(
+            stage="connecting", tokens=0, tokens_per_second=0.0
+        )
         start = time.perf_counter()
         first_token_at: float | None = None
         chars = 0
         usage_tokens: int | None = None
+        last_emit = 0.0
         payload: dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
@@ -335,6 +391,9 @@ class OpenAILLM(BaseLLM):
                         raise LLMError(
                             f"Сервер вернул {response.status_code}: {body[:600]}"
                         )
+                    self._emit_progress(
+                        stage="prompt", tokens=0, tokens_per_second=0.0
+                    )
                     for line in response.iter_lines():
                         line = line.strip()
                         if not line or not line.startswith("data:"):
@@ -360,9 +419,24 @@ class OpenAILLM(BaseLLM):
                         delta = first.get("delta") or {}
                         chunk = delta.get("content") or first.get("text") or ""
                         if chunk:
+                            now = time.perf_counter()
                             if first_token_at is None:
-                                first_token_at = time.perf_counter()
+                                first_token_at = now
                             chars += len(chunk)
+                            estimated = usage_tokens or max(
+                                1, round(chars / 3)
+                            )
+                            if now - last_emit >= 0.2:
+                                elapsed = max(
+                                    0.001, now - first_token_at
+                                )
+                                self._emit_progress(
+                                    stage="generation",
+                                    tokens=estimated,
+                                    elapsed=elapsed,
+                                    tokens_per_second=estimated / elapsed,
+                                )
+                                last_emit = now
                             yield chunk
         except httpx.ConnectError as exc:
             raise LLMError(
@@ -379,6 +453,12 @@ class OpenAILLM(BaseLLM):
                 seconds=seconds,
                 tokens_per_second=tokens / seconds,
                 estimated=usage_tokens is None,
+            )
+            self._emit_progress(
+                stage="done",
+                tokens=tokens,
+                elapsed=seconds,
+                tokens_per_second=tokens / seconds,
             )
 
     def health(self) -> str:
@@ -429,6 +509,9 @@ class MockLLM(BaseLLM):
         seed: int | None = None,
     ) -> Iterator[str]:
         self.last_stats = None
+        self._emit_progress(
+            stage="prompt", tokens=0, tokens_per_second=0.0
+        )
         system = messages[0]["content"] if messages else ""
         if "Режим заготовок" in system:
             index = self.counter if seed is None else seed
@@ -442,7 +525,14 @@ class MockLLM(BaseLLM):
             ]
             text = beats[int(index) % len(beats)]
             self._mock_stats(text)
+            tokens = max(1, len(text) // 4)
+            self._emit_progress(
+                stage="generation", tokens=tokens, tokens_per_second=20.0
+            )
             yield text
+            self._emit_progress(
+                stage="done", tokens=tokens, tokens_per_second=20.0
+            )
             return
         if "Разворот заготовки" in system:
             match = re.search(
@@ -454,7 +544,14 @@ class MockLLM(BaseLLM):
                 "*садится обратно* я уже думала, ты не придёшь."
             )
             self._mock_stats(text)
+            tokens = max(1, len(text) // 4)
+            self._emit_progress(
+                stage="generation", tokens=tokens, tokens_per_second=20.0
+            )
             yield text
+            self._emit_progress(
+                stage="done", tokens=tokens, tokens_per_second=20.0
+            )
             return
         if "Придумай конкретную" in system and "JSON" in system:
             index = self.counter if seed is None else seed
@@ -464,7 +561,6 @@ class MockLLM(BaseLLM):
                     "situation": "она нашла старый профиль в соцсетях и ревнует",
                     "relationship": "встречаетесь три месяца",
                     "her_goal": "получить объяснение, а не оправдание",
-                    "my_goal": "не ссориться, но и не врать",
                     "tone": "серьёзный, с колкостями",
                     "restrictions": "не мириться в первые три хода",
                     "opener": "her",
@@ -473,7 +569,6 @@ class MockLLM(BaseLLM):
                     "situation": "вы договорились встретиться, но он опоздал на час",
                     "relationship": "дружите давно, недавно начали встречаться",
                     "her_goal": "понять, насколько она ему важна",
-                    "my_goal": "объяснить задержку без ощущения вины",
                     "tone": "раздражённый, но с надеждой",
                     "restrictions": "не оправдываться работой больше двух раз",
                     "opener": "her",
@@ -483,7 +578,14 @@ class MockLLM(BaseLLM):
                 cards[int(index) % len(cards)], ensure_ascii=False
             )
             self._mock_stats(text)
+            tokens = max(1, len(text) // 4)
+            self._emit_progress(
+                stage="generation", tokens=tokens, tokens_per_second=20.0
+            )
             yield text
+            self._emit_progress(
+                stage="done", tokens=tokens, tokens_per_second=20.0
+            )
             return
 
         index = self.counter if seed is None else seed
@@ -492,8 +594,15 @@ class MockLLM(BaseLLM):
         prefix = f"[mock T={temperature:.2f}] " if temperature is not None else "[mock] "
         full = prefix + text
         self._mock_stats(full)
+        tokens = max(1, len(full) // 4)
+        self._emit_progress(
+            stage="generation", tokens=tokens, tokens_per_second=20.0
+        )
         for word in full.split(" "):
             yield word + " "
+        self._emit_progress(
+            stage="done", tokens=tokens, tokens_per_second=20.0
+        )
 
     def _mock_stats(self, text: str) -> None:
         tokens = max(1, len(text) // 4)

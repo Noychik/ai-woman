@@ -52,6 +52,7 @@ class Case:
     updated_at: str
     relationship: str | None = None
     her_goal: str | None = None
+    # Deprecated: оставлено для чтения старых строк БД.
     my_goal: str | None = None
     tone: str | None = None
     restrictions: str | None = None
@@ -65,7 +66,6 @@ class Case:
             "situation": self.situation,
             "relationship": self.relationship,
             "her_goal": self.her_goal,
-            "my_goal": self.my_goal,
             "tone": self.tone,
             "restrictions": self.restrictions,
             "opener": self.opener,
@@ -492,7 +492,6 @@ class Store:
             "situation": situation,
             "relationship": fields.get("relationship"),
             "her_goal": fields.get("her_goal"),
-            "my_goal": fields.get("my_goal"),
             "tone": fields.get("tone"),
             "restrictions": fields.get("restrictions"),
             "opener": fields.get("opener") or "her",
