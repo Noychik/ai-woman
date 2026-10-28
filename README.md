@@ -41,7 +41,7 @@ Ollama (Arch):
 ```bash
 yay -S ollama
 sudo systemctl enable --now ollama
-ollama pull qwen3:4b-instruct-2507-q4_K_M
+ollama pull gemma3:12b
 ```
 
 Если ставишь без root, можно распаковать официальный tarball в `~/.local`
@@ -79,8 +79,8 @@ systemctl --user status ollama
 
 | Модель | Тег Ollama | Комментарий |
 |---|---|---|
-| Qwen3 4B Instruct 2507 | `qwen3:4b-instruct-2507-q4_K_M` | стоит по умолчанию, SFW |
-| Gemma 3 12B | `gemma3:12b` | 6.8 ГБ, качественнее, но ~4 ток/с |
+| Gemma 3 12B | `gemma3:12b` | стоит по умолчанию, SFW; лучшее качество, ~4.2 ток/с |
+| Qwen3 4B Instruct 2507 | `qwen3:4b-instruct-2507-q4_K_M` | быстрый fallback, ~9.8 ток/с |
 | Mistral Nemo 12B | `mistral-nemo:12b` | 6.6 ГБ, мультиязычный, ~4 ток/с |
 | Gemma 3 4B | `gemma3:4b` | мягче, хорошо держит персонажа |
 | Qwen2.5 3B | `qwen2.5:3b-instruct` | быстрее, слабее в сложных сценах |
@@ -108,6 +108,8 @@ SMT для LLM здесь только мешает. На сервере с 20 �
 Mistral Nemo 12B, Qwen3 8B abliterated и официальная 4B. 7B/8B abliterated
 на этой ветке можно использовать как SFW-модели, adult-промпты — в ветке
 `adult`.
+
+Результаты последнего прогона и выводы — в `BENCHMARKS.md`.
 
 ## Кейсы
 

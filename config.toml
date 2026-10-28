@@ -5,7 +5,7 @@
 # (llama.cpp server, LM Studio, vLLM, OpenRouter и т.д.)
 backend = "ollama"
 base_url = "http://127.0.0.1:11434"
-model = "qwen3:4b-instruct-2507-q4_K_M"
+model = "gemma3:12b"
 
 # Для Ollama не нужен, для внешних API — ключ.
 api_key = ""
