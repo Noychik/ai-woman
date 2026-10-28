@@ -395,7 +395,8 @@ class TuiApp:
         action = items[min(self.modal_sel, len(items) - 1)][1]
         self.modal_open = False
         self._focus_input()
-        action()
+        if callable(action):
+            action()
         self.invalidate()
 
     def _modal_filter_char(self, char: str) -> None:
@@ -429,12 +430,30 @@ class TuiApp:
             ("статистика", self._stats_hint),
             ("экспорт markdown", lambda: self._export("md")),
             ("экспорт jsonl", lambda: self._export("jsonl")),
-            ("помощь", self._help_hint),
+            ("помощь", self._open_help),
             ("выход", self.app.exit),
         ]
 
     def _open_palette(self) -> None:
         self._open_modal("команды", self._command_items())
+
+    def _help_items(self) -> list[tuple[str, Any]]:
+        return [
+            ("Enter — отправить сообщение", None),
+            ("Alt+Enter — перенос строки во вводе", None),
+            ("Tab — фокус: ввод → история → сессии", None),
+            ("↑/↓ + Enter — выбрать сессию в сайдбаре", None),
+            ("Ctrl+N — новая сессия", None),
+            ("Ctrl+P — палитра команд", None),
+            ("PageUp/PageDown, Home/End — прокрутка истории", None),
+            ("Ctrl+←/→, Ctrl+Backspace — по словам", None),
+            ("Ctrl+C / Ctrl+Q — выход", None),
+            ("команды: /new, /sessions, /switch, /model, /help", None),
+            ("полный список команд — /help в --no-tui", None),
+        ]
+
+    def _open_help(self) -> None:
+        self._open_modal("помощь (Esc — закрыть)", self._help_items())
 
     def _model_menu(self) -> None:
         models = self.llm.list_models()
@@ -508,9 +527,6 @@ class TuiApp:
                 lines.append("")
             path.write_text("\n".join(lines), encoding="utf-8")
         self._flash(f"экспорт: {path}")
-
-    def _help_hint(self) -> None:
-        self._flash("Ctrl+P — команды · Tab — фокус · Ctrl+N — сессия · Ctrl+C — выход")
 
     async def _generate(self) -> None:
         self.busy = True
@@ -620,7 +636,7 @@ class TuiApp:
                 self._flash("/switch ID")
             return
         if name in ("/help", "\\р", "/h", "/?"):
-            self._flash("Ctrl+C/Ctrl+Q — выход, Enter — отправить")
+            self._open_help()
             return
         self._flash(f"команда {name} пока не в TUI")
 
