@@ -16,7 +16,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 
-from .cli import build_key_bindings, persona_name
+from .cli import build_key_bindings, parse_id, persona_name
 from .config import Config
 from .llm import BaseLLM, LLMError, make_llm, strip_thinking
 from .prompt import build_messages as assemble_messages
@@ -77,7 +77,9 @@ class TuiApp:
 
         self.transcript_buffer = Buffer(read_only=True, multiline=True)
         self.status_control = FormattedTextControl(self._status_text)
-        self.session_control = FormattedTextControl(self._sessions_text)
+        self.session_control = FormattedTextControl(
+            self._sessions_text, focusable=True
+        )
         self.input_area = TextArea(
             prompt="ты › ",
             multiline=True,
@@ -119,6 +121,17 @@ class TuiApp:
         if latest is not None:
             return latest
         return self.store.create_session("первый разговор")
+
+    def _switch_session(self, session_id: int) -> None:
+        if not self.store.get_session(session_id):
+            return
+        self.session_id = session_id
+        self.at_bottom = True
+        self.streaming_active = False
+        self.streaming = ""
+        self._refresh_sessions()
+        self._render_transcript()
+        self.invalidate()
 
     # ── layout ────────────────────────────────────────────────────────────
 
@@ -171,12 +184,14 @@ class TuiApp:
     def _sessions_text(self) -> Any:
         if not self.sessions:
             return [("class:help", " сессий нет")]
-        lines: list[Any] = [("class:help", " сессии\n")]
+        lines: list[Any] = [("class:help", " сессии (Tab, ↑↓, Enter)\n")]
         for index, session in enumerate(self.sessions):
             mark = ">" if index == self.sel_index else " "
             style = "class:sidebar.active" if index == self.sel_index else ""
-            title = (session.get("title") or "разговор")[:20]
+            title = (session.get("title") or "разговор")[:18]
+            preview = (session.get("preview") or "—")[:16]
             lines.append((style, f"{mark} {session['id']:>3} {title}\n"))
+            lines.append(("class:help", f"       {preview}\n"))
         return lines
 
     def _refresh_sessions(self) -> None:
@@ -187,11 +202,24 @@ class TuiApp:
                 "title": row["title"] or "разговор",
                 "n": row["n"],
                 "run_id": row["run_id"],
+                "preview": self._session_preview(row["id"]),
             }
             for row in rows
         ]
         if self.sel_index >= len(self.sessions):
             self.sel_index = max(0, len(self.sessions) - 1)
+
+    def _session_preview(self, session_id: int) -> str:
+        last = self.store.messages(
+            session_id,
+            roles=("user", "assistant"),
+            include_hidden=False,
+            limit=1,
+        )
+        if not last:
+            return ""
+        text = " ".join(last[0].content.split())
+        return text[:40]
 
     # ── transcript ────────────────────────────────────────────────────────
 
@@ -374,6 +402,21 @@ class TuiApp:
             self._render_transcript()
             self.invalidate()
             return
+        if name in ("/sessions", "/session", "\\ы"):
+            self._refresh_sessions()
+            self.app.layout.focus(self.session_control)
+            self.invalidate()
+            return
+        if name == "/switch":
+            arg = text.split(" ", 1)[1] if " " in text else ""
+            session_id = parse_id(arg)
+            if session_id is not None:
+                self._switch_session(session_id)
+                self.app.layout.focus(self.input_area)
+                self.invalidate()
+            else:
+                self._flash("/switch ID")
+            return
         if name in ("/help", "\\р", "/h", "/?"):
             self._flash("Ctrl+C/Ctrl+Q — выход, Enter — отправить")
             return
@@ -395,7 +438,35 @@ class TuiApp:
             if app.layout.has_focus(self.input_area):
                 app.layout.focus(self.transcript_buffer)
             elif app.layout.has_focus(self.transcript_buffer):
+                app.layout.focus(self.session_control)
+            else:
                 app.layout.focus(self.input_area)
+
+        @kb.add(Keys.Up, filter=has_focus(self.session_control), eager=True)
+        def _(event) -> None:
+            if self.sessions:
+                self.sel_index = max(0, self.sel_index - 1)
+                self.invalidate()
+
+        @kb.add(Keys.Down, filter=has_focus(self.session_control), eager=True)
+        def _(event) -> None:
+            if self.sessions:
+                self.sel_index = min(len(self.sessions) - 1, self.sel_index + 1)
+                self.invalidate()
+
+        @kb.add("enter", filter=has_focus(self.session_control), eager=True)
+        def _(event) -> None:
+            if self.sessions:
+                self._switch_session(self.sessions[self.sel_index]["id"])
+                event.app.layout.focus(self.input_area)
+
+        @kb.add(Keys.ControlN)
+        def _(event) -> None:
+            self.session_id = self.store.create_session()
+            self._refresh_sessions()
+            self._render_transcript()
+            event.app.layout.focus(self.input_area)
+            self.invalidate()
 
         @kb.add("enter", filter=has_focus(self.input_area), eager=True)
         def _(event) -> None:
