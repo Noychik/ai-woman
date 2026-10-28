@@ -175,10 +175,16 @@ class OllamaLLM(BaseLLM):
             payload["keep_alive"] = self.cfg.keep_alive
 
         url = self.cfg.base_url.rstrip("/") + "/api/chat"
+        loaded = self._is_model_loaded()
         try:
             with httpx.Client(
                 timeout=httpx.Timeout(self.cfg.timeout, connect=5.0)
             ) as client:
+                self._emit_progress(
+                    stage="prompt" if loaded else "load",
+                    tokens=0,
+                    tokens_per_second=0.0,
+                )
                 with client.stream("POST", url, json=payload) as response:
                     if response.status_code >= 400:
                         body = b"".join(response.iter_bytes()).decode(
@@ -306,6 +312,12 @@ class OllamaLLM(BaseLLM):
         models = data.get("models") or []
         return [model for model in models if isinstance(model, dict)]
 
+    def _is_model_loaded(self) -> bool:
+        return any(
+            model.get("name") == self.cfg.model
+            for model in self.loaded_models()
+        )
+
     def _keep_alive(self, keep_alive: int | float | str) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.cfg.model,
@@ -381,6 +393,9 @@ class OpenAILLM(BaseLLM):
             with httpx.Client(
                 timeout=httpx.Timeout(self.cfg.timeout, connect=5.0)
             ) as client:
+                self._emit_progress(
+                    stage="prompt", tokens=0, tokens_per_second=0.0
+                )
                 with client.stream(
                     "POST", url, json=payload, headers=headers
                 ) as response:
@@ -391,9 +406,6 @@ class OpenAILLM(BaseLLM):
                         raise LLMError(
                             f"Сервер вернул {response.status_code}: {body[:600]}"
                         )
-                    self._emit_progress(
-                        stage="prompt", tokens=0, tokens_per_second=0.0
-                    )
                     for line in response.iter_lines():
                         line = line.strip()
                         if not line or not line.startswith("data:"):
