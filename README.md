@@ -33,46 +33,199 @@
 - **Бэкенды** — Ollama (нативно) или любой OpenAI-совместимый сервер.
 - **Заглушка** — `--mock`, чтобы проверить интерфейс без модели.
 
-## Быстрый старт
+## Установка
+
+### Требования
+
+- Linux или macOS; на Windows проще всего через WSL2.
+- **Python 3.11+** — проект использует `tomllib` из стандартной библиотеки.
+- **Ollama** — локально или на другом компьютере в LAN. Подойдёт и любой
+  OpenAI-совместимый сервер (`llama.cpp server`, LM Studio, vLLM и т.п.).
+- Терминал с UTF-8. Полноэкранный TUI лучше работает в Kitty, Alacritty,
+  WezTerm, GNOME Terminal, Konsole или Windows Terminal.
+- Для 4B-модели хватит 8 ГБ RAM, для 8B/12B комфортнее 16 ГБ.
+  Модели занимают примерно 2.5–8 ГБ на диске.
+
+### 1. Клонировать репозиторий
 
 ```bash
+git clone https://github.com/<USER>/companion.git
 cd companion
+```
+
+Для приватного репозитория используйте SSH-адрес:
+
+```bash
+git clone git@github.com:<USER>/companion.git
+cd companion
+```
+
+### 2. Создать окружение и установить зависимости
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Ollama (Arch):
+На Windows в PowerShell активация другая:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+Проверить версию Python:
 
 ```bash
-yay -S ollama
+python --version
+```
+
+Должно быть `3.11` или новее.
+
+### 3. Запустить Ollama и скачать модель
+
+Linux, официальный установщик:
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
 sudo systemctl enable --now ollama
 ollama pull gemma3:12b
 ```
 
-Если ставишь без root, можно распаковать официальный tarball в `~/.local`
-и запускать `ollama serve` от пользователя. В этом проекте так и сделано:
+Arch Linux:
 
 ```bash
-~/.local/ollama/bin/ollama list
-systemctl --user status ollama
+sudo pacman -S ollama
+sudo systemctl enable --now ollama
+ollama pull gemma3:12b
 ```
 
-Юнит лежит в `~/.config/systemd/user/ollama.service`, модель —
-в `~/.local/share/ollama/models`. Главное — чтобы `base_url` в `config.toml`
-совпадал с портом.
+macOS: установите Ollama из приложения с официального сайта и выполните
+`ollama pull gemma3:12b` в терминале. На Windows — установщик Ollama
+или WSL2.
 
-Запуск:
+Если RAM мало или нужен быстрый ответ на CPU, возьмите 4B-модель:
+
+```bash
+ollama pull qwen3:4b-instruct-2507-q4_K_M
+```
+
+Проверка, что Ollama отвечает:
+
+```bash
+curl http://127.0.0.1:11434/api/tags
+```
+
+В ответе должен быть JSON со списком моделей.
+
+Если не хочется ставить Ollama системно, можно распаковать официальный
+tarball в `~/.local` и запускать `ollama serve` от пользователя:
+
+```bash
+~/.local/ollama/bin/ollama serve
+```
+
+Тогда модели обычно лежат в `~/.local/share/ollama/models`, а `base_url`
+в `config.toml` должен указывать на тот же порт.
+
+### 4. Настроить `config.toml`
+
+Минимально нужно проверить три поля:
+
+```toml
+[llm]
+backend = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "gemma3:12b"
+```
+
+Если Ollama работает на другом компьютере:
+
+```toml
+[llm]
+base_url = "http://192.168.1.50:11434"
+```
+
+Порт `11434` нельзя открывать в интернет: у Ollama нет авторизации.
+Используйте LAN, VPN или Tailscale.
+
+Для OpenAI-совместимого сервера:
+
+```toml
+[llm]
+backend = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+model = "local-model"
+api_key = ""
+```
+
+`api_key` нужен только внешнему API. Не коммитьте настоящие ключи.
+
+Остальные настройки — контекст, температура, число вариантов, режим
+`messaging`/`roleplay` — описаны комментариями прямо в `config.toml`.
+
+### 5. Запустить
 
 ```bash
 ./run.sh
 ```
 
-Проверка без модели:
+Или без обёртки:
+
+```bash
+.venv/bin/python -m companion
+```
+
+Проверка интерфейса без модели и без Ollama:
 
 ```bash
 ./run.sh --mock
 ```
+
+Старый линейный чат вместо полноэкранного TUI:
+
+```bash
+./run.sh --no-tui
+```
+
+Другой конфиг:
+
+```bash
+./run.sh --config /path/to/config.toml
+```
+
+### 6. Проверить установку
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+Ожидается `OK` и все тесты пройдены (в текущей версии — 68).
+
+### Данные и резервная копия
+
+Рабочие данные лежат в `data/` и **не попадают в git**:
+
+- `data/chat.db` — история сессий, сообщений, кейсов и прогонов;
+- `data/preferences.jsonl` — датасет выборов, правок и оценок;
+- `data/runs/` — экспортированные завершённые прогоны;
+- `data/exports/` — экспорт диалогов.
+
+Перед удалением проекта или переустановкой сделайте бэкап:
+
+```bash
+tar czf companion-data-$(date +%F).tar.gz data
+```
+
+Восстановление:
+
+```bash
+tar xzf companion-data-2026-01-01.tar.gz
+```
+
+`config.toml` и `persona.md` уже в репозитории. Если вы их меняли,
+не забудьте закоммитить или скопировать отдельно.
 
 ## TUI
 
@@ -188,7 +341,7 @@ Mistral Nemo 12B, Qwen3 8B abliterated и официальная 4B. 7B/8B ablit
 на этой ветке можно использовать как SFW-модели, adult-промпты — в ветке
 `adult`.
 
-Результаты последнего прогона и выводы — в `BENCHMARKS.md`.
+Результаты складываются локально в `data/bench/` и в репозиторий не попадают.
 
 ## Кейсы
 
